@@ -1,0 +1,12 @@
+# The observability namespace: Prometheus and Grafana for in-cluster load tests.
+#
+# Kept separate from the namespace under test (perf-test by default) on purpose.
+# The API's namespace should contain the API and nothing else, so that "what is
+# competing with the workload for CPU on this node" has a short answer. The
+# metrics stack lives here with its own resource requests instead.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: perf-observability
+  labels:
+    app.kubernetes.io/part-of: perf-test-kit

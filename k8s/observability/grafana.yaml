@@ -1,0 +1,100 @@
+# Grafana for load-test runs, in the cluster next to Prometheus.
+#
+# Why a second Grafana rather than pointing the compose one at this Prometheus:
+#
+#   * The datasource is then an in-cluster Service (`http://prometheus:9090`), so
+#     the provisioning file is byte-for-byte the same one the compose stack uses.
+#     No host-networking, no NodePort, no second set of connection settings to
+#     drift apart.
+#   * The k8s stack keeps working when the compose stack is down, and the two
+#     cannot silently share a Prometheus with different retention.
+#
+# The datasource uid stays `prometheus`, and the dashboards are the SAME files
+# from k6/grafana/dashboards, so there is exactly one copy of each dashboard and
+# it is used by both paths.
+#
+# The provisioning and dashboard ConfigMaps are created by
+# scripts/deploy-observability.ps1 from k6/grafana/, so the files remain the single
+# source of truth. ConfigMap keys cannot contain "/", which is why the datasource
+# and the dashboard-provider are mounted individually with subPath below.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: perf-observability
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Admin"
+            - name: GF_AUTH_BASIC_ENABLED
+              value: "false"
+            - name: GF_SECURITY_ALLOW_EMBEDDING
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # Memory only, same reasoning as Prometheus: a throttled dashboard
+              # server is a broken window onto the measurement.
+              memory: 512Mi
+          volumeMounts:
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/datasources/prometheus.yml
+              subPath: prometheus.yml
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yml
+              subPath: dashboards.yml
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: provisioning
+          configMap:
+            name: grafana-provisioning
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: perf-observability
+  labels:
+    app: grafana
+spec:
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      # Reachable from the host browser at http://127.0.0.1:30030
+      nodePort: 30030
+  type: NodePort

@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# kustomize is built into kubectl, so this needs no extra tooling:
+#   kubectl apply -k k8s/base
+#
+# `namespace` is declared here rather than in each manifest, which keeps the
+# number of places a namespace is written down at one, and lets an overlay
+# override it.
+namespace: perf-test
+
+resources:
+  - api-service.yaml
+  - api-deployment.yaml

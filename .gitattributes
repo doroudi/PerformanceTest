@@ -1,0 +1,14 @@
+# Line endings.
+#
+# With core.autocrlf=true (the Windows default), a checkout turns shell scripts
+# into CRLF files, and a POSIX shell then fails with "bad interpreter: No such file
+# or directory" because of the carriage return after the shebang. These entry points
+# must work in bash/WSL/Git Bash and on Linux CI, so their line endings are pinned
+# here rather than left to the developer's git config.
+#
+# Deliberately NOT a catch-all `* text=auto`: the already-committed YAML and
+# dashboard JSON in this repository are CRLF in the working tree, and a global rule
+# would renormalise them and show up as a large diff unrelated to any real change.
+*.sh    text eol=lf
+*.bash  text eol=lf
+Dockerfile text eol=lf

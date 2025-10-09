@@ -1,0 +1,142 @@
+# Local observability + authoring stack.
+#
+# What runs here:
+#   prometheus    the metrics sink. k6 remote-writes into it, Grafana reads it.
+#   grafana       the dashboards (provisioned from ./grafana, see below).
+#   demo-target   a tiny, always-available HTTP target so the kit can prove
+#                 itself end to end without your application. See "Demo target".
+#   k6            the generator, behind the "k6" profile: only starts when asked.
+#
+# All published ports are bound to 127.0.0.1 on purpose. Docker Desktop also
+# publishes on IPv6, and its IPv6 proxy does not answer on this machine, so
+# `http://localhost:3000` HANGS (browsers wait, then fall back; scripts and
+# curl just time out) while `http://127.0.0.1:3000` works instantly. Binding to
+# loopback only also means Grafana - which runs with anonymous admin - is not
+# exposed on every network interface.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Without this the remote-write receiver is disabled and every k6 push is
+      # rejected with a 404/405. It is the single most common reason for an
+      # empty dashboard.
+      - --web.enable-remote-write-receiver
+      # REQUIRED by the k6 service below, which pushes trends as native
+      # histograms. Without this flag Prometheus rejects those samples and the
+      # push fails - k6 reports it as level=error in the run log. If you point
+      # the kit at a Prometheus you do not control, that Prometheus needs this
+      # flag too, or you must switch k6 back to gauge mode (see the k6 service).
+      - --enable-feature=native-histograms
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus-config.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - k6
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_BASIC_ENABLED=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      # Turn the "dashboard not found" 404 into a visible error instead of a
+      # silently blank page when a uid in a shared link is wrong.
+      - GF_LOG_FILTERS=provisioning:debug
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - k6
+
+  # A known-good target that is always up, so "is the kit broken or is my API
+  # broken?" is answerable in one command:
+  #
+  #   pwsh -File k6/run-test.ps1 -TargetUrl http://demo-target:80/ -TestType smoke
+  #
+  # traefik/whoami answers any path with a small JSON document describing the
+  # request, which makes it a realistic JSON endpoint for exercising the
+  # generator and the metrics pipeline.
+  #
+  # It is NOT a performance model of anything. A green run against this proves
+  # the harness works, and nothing about your system's capacity.
+  demo-target:
+    image: traefik/whoami:v1.10.2
+    ports:
+      # Published only so you can eyeball it in a browser; k6 reaches it over
+      # the compose network as http://demo-target:80/ and needs no host port.
+      - "127.0.0.1:8081:80"
+    networks:
+      - k6
+
+  k6:
+    # Pinned, and pinned to the SAME tag as k6/Dockerfile. Both the 0.x line and
+    # 1.x accept the output name below (verified by running both), but a
+    # different generator version is still a different experiment, so local and
+    # cluster runs must not drift apart.
+    image: grafana/k6:1.3.0
+    profiles: ["k6"]                 # only starts when you explicitly request it
+    environment:
+      # K6_OUT is what actually enables an output. K6_PROMETHEUS_RW_SERVER_URL
+      # only says WHERE to send: on its own it does nothing, and the run then
+      # succeeds while writing no metrics at all - which is what leaves Grafana
+      # empty with no error anywhere to explain it.
+      - K6_OUT=experimental-prometheus-rw
+      - K6_PROMETHEUS_RW_SERVER_URL=http://prometheus:9090/api/v1/write
+      # Send trends as Prometheus NATIVE HISTOGRAMS (k6_http_req_duration_seconds)
+      # rather than as pre-computed gauge statistics.
+      #
+      # This is not cosmetic, it changes what the dashboard can show. Verified on
+      # a real 40s run against the demo target:
+      #
+      #   gauges     k6_http_req_duration_p95 held 0.0243 flat for every one of 67
+      #              samples, and k6_http_req_duration_max held one value for the
+      #              whole run. They are CUMULATIVE over the run, so they converge
+      #              and then never move. A latency spike 5 minutes into a 2-hour
+      #              soak is invisible - which is precisely the signal a soak
+      #              exists to find.
+      #   histograms histogram_quantile(0.95, sum(rate(k6_http_req_duration_seconds
+      #              [30s]))) returns a real per-interval percentile (23.97ms),
+      #              so spikes and drift are visible.
+      #
+      # Requires --enable-feature=native-histograms on Prometheus (set above).
+      # To go back to gauges, set this to false - TREND_STATS below then takes
+      # over, and the dashboard falls back automatically (its latency panels use
+      # PromQL `or` to accept either shape).
+      - K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM=true
+      # Used only when the line above is false. Kept in sync with TREND_STATS in
+      # scripts/lib/env.js so local and cluster runs report the same statistics.
+      - K6_PROMETHEUS_RW_TREND_STATS=p(90),p(95),p(99),min,max,avg,med
+      # Push cadence. Shorter = smoother live panels, more load on Prometheus.
+      - K6_PROMETHEUS_RW_PUSH_INTERVAL=2s
+    volumes:
+      - ./scripts:/scripts:ro
+    # Docker Desktop injects host.docker.internal on its own; native Linux Docker
+    # does not, and the same -TargetUrl then fails with a DNS error instead of a
+    # connection error. host-gateway resolves to the host's bridge address, so this
+    # is a no-op on Docker Desktop and the thing that makes it work on Linux/CI.
+    #
+    # Note this reaches the host's *bridge* interface: a service bound only to
+    # 127.0.0.1 is still unreachable that way (it must bind 0.0.0.0 as well).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - k6
+    # No default command - you pass it on the CLI (or use k6/run-test.ps1).
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  k6:

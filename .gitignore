@@ -1,0 +1,28 @@
+# Run artefacts, not source.
+#
+# Every run writes results/<utc timestamp>-<type>/ with k6.log, summary.json,
+# meta.json and the applied Job manifest. These are the evidence a result is
+# explained by, so they are deliberately not cleaned up by the runners - but they
+# are per-run output and do not belong in git. Accepted numbers live in baselines/.
+results/
+
+# Per-run kustomize overlays, regenerated from k8s/base on every deploy.
+k8s/.generated/
+
+# Publish output for the application image.
+#
+# Ignored for a security reason as much as a hygiene one: the publish folder is where
+# the application's own .env is written so the container can reach HashiCorp Vault, and
+# that file contains a live Vault token. An untracked-but-not-ignored .build/ is one
+# `git add -A` away from committing a credential.
+.build/
+
+# Local credentials for the runners.
+#
+# k6/.env holds the account password, the login URL and any IdP client secret that
+# run-test.ps1, run-journey.ps1 and deploy-and-test.ps1 read. k6/.env.example is the
+# committed template; the real file never is.
+.env
+*.env
+!.env.example
+results/

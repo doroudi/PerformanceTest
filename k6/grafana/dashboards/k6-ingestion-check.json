@@ -1,0 +1,146 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Proves that k6 actually delivered metrics to Prometheus. Panels match metric names by regex (k6_.*) on purpose, so they keep working across k6 versions and remote-write namings.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "count(count by (__name__) ({__name__=~\"k6_.*\"}))",
+          "instant": true,
+          "legendFormat": "metric names",
+          "refId": "A"
+        }
+      ],
+      "title": "k6 metric names received",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(count_over_time({__name__=~\"k6_.*\"}[1m]))",
+          "legendFormat": "samples/min",
+          "refId": "A"
+        }
+      ],
+      "title": "k6 samples ingested per minute",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "legend": { "calcs": ["max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate({__name__=~\"k6_http_reqs.*\"}[1m]))",
+          "legendFormat": "requests/s",
+          "refId": "A"
+        }
+      ],
+      "title": "HTTP request rate (from k6)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 5 },
+      "id": 4,
+      "options": {
+        "legend": { "calcs": ["max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max({__name__=~\"k6_vus.*\"})",
+          "legendFormat": "VUs",
+          "refId": "A"
+        }
+      ],
+      "title": "Virtual users",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 5 },
+      "id": 5,
+      "options": { "showHeader": true, "cellHeight": "sm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "count by (__name__) ({__name__=~\"k6_.*\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "What k6 actually sent (series per metric)",
+      "type": "table"
+    },
+    {
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 11 },
+      "id": 6,
+      "options": {
+        "content": "## If these panels are empty\n\nWork through this in order - it isolates the layer that is broken.\n\n1. **Did k6 send anything?** Prometheus should list k6 series:\n   [http://127.0.0.1:9090/api/v1/label/__name__/values](http://127.0.0.1:9090/api/v1/label/__name__/values)\n   If that has no `k6_*` names, the problem is on the k6 side: the output extension\n   is not enabled. `K6_PROMETHEUS_RW_SERVER_URL` only says *where* to send;\n   `K6_OUT=experimental-prometheus-rw` is what enables sending at all (the same\n   name works on k6 0.x and 1.x).\n2. **Remember that k6 only writes while the test runs.** A finished run is invisible\n   to an instant query at `now`. Set the time range to cover the run (the runner\n   prints a link that does this for you) before concluding anything is broken.\n3. **Is the target endpoint up?** [http://127.0.0.1:9090/targets](http://127.0.0.1:9090/targets)\n   and check the Prometheus container log for remote-write rejections. The receiver\n   needs `--web.enable-remote-write-receiver`, and native histograms need\n   `--enable-feature=native-histograms`.\n4. **Is this datasource the right one?** See Connections -> Data sources:\n   it must point at `http://prometheus:9090` from inside the compose network, and\n   there must be only ONE Prometheus datasource - a second, hand-made one with an\n   empty URL makes every panel render empty.\n5. **Use `127.0.0.1`, not `localhost`.** Docker Desktop also publishes these ports\n   on IPv6 and its IPv6 proxy does not answer here, so `http://localhost:9090`\n   hangs while `http://127.0.0.1:9090` works.\n6. **Did the run flushes land?** k6 pushes every ~2s and once more at the end of\n   the test, so a run of a few seconds can produce very few samples.\n\nThis dashboard is a diagnostic. The real report is **k6 load test** in the same\nfolder.",
+        "mode": "markdown"
+      },
+      "title": "Troubleshooting: no data in Grafana",
+      "type": "text"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["k6", "perf-test-kit"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "k6 ingestion check (Prometheus)",
+  "uid": "perf-kit-ingest-check",
+  "version": 1
+}

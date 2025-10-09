@@ -1,0 +1,23 @@
+# Grafana datasource: the Prometheus that k6 remote-writes into.
+#
+# Why this file has to exist: without a provisioned datasource Grafana starts with
+# NO datasource at all, so every panel renders empty ("no data") even when
+# Prometheus is full of metrics. Provisioning the datasource here also gives it a
+# stable uid, so a dashboard JSON can reference it by uid instead of by name.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # k6's remote-write output flushes every 5s (K6_PROMETHEUS_RW_PUSH_INTERVAL),
+      # so telling Grafana the scrape/ingest interval keeps rate() queries from
+      # looking spiky.
+      timeInterval: 5s
+      httpMethod: POST
+      prometheusType: Prometheus
+      prometheusVersion: 2.54.1
