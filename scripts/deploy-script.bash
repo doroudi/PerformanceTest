@@ -1,23 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Deploy the API under test and stop, without running a scenario.
+#
+# Thin wrapper over the PowerShell runner's -DeployOnly mode, so the deployment
+# settings (image, port, environment, probes, kustomize overlay generation) exist
+# in exactly one place.
+#
+# Usage:
+#   ./scripts/deploy-script.bash -Image my-api:1.4.2
+#   ./scripts/deploy-script.bash -Image my-api:1.4.2 -Namespace perf-test -Replicas 2
 
-set -e
+set -euo pipefail
 
-echo "🚀 Deploying ASP.NET API to Kubernetes..."
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Create namespace
-kubectl apply -f k8s/namespace.yaml
+if ! command -v pwsh >/dev/null 2>&1; then
+    echo "pwsh (PowerShell 7+) is required: this wrapper only forwards to the PowerShell runner." >&2
+    echo "Equivalent by hand: kubectl apply -k k8s/overlays/local" >&2
+    exit 1
+fi
 
-# Build and deploy your API (modify according to your build process)
-# Example: 
-# docker build -t your-aspnet-api:latest ../your-api-project
-# kind load docker-image your-aspnet-api:latest  # if using kind
-
-# Deploy API
-kubectl apply -f k8s/api-deployment.yaml
-kubectl apply -f k8s/api-service.yaml
-
-# Wait for deployment to be ready
-echo "⏳ Waiting for API to be ready..."
-kubectl wait --for=condition=available --timeout=300s deployment/api-deployment -n perf-test
-
-echo "✅ API deployed successfully!"
+exec pwsh -NoProfile -File "${script_dir}/deploy-and-test.ps1" -DeployOnly "$@"

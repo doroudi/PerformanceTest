@@ -1,0 +1,24 @@
+# One port, one number.
+#
+# The previous setup applied this Service and then patched a second port onto it.
+# Because Service `ports` merge on the `port` key, that did not replace anything:
+# it left `port: 80 -> targetPort: 80` in place next to the new 8080 entry, so the
+# Service advertised a route with nothing listening behind it - which is why the
+# scenario scripts' `http://api-service/` default could never have worked.
+#
+# `targetPort: http` refers to the named container port, so the number 8080 lives
+# in exactly one place.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  labels:
+    app: api
+spec:
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+  type: ClusterIP

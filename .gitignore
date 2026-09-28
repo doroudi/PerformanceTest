@@ -1,0 +1,10 @@
+# Run artefacts, not source.
+#
+# Every run writes results/<utc timestamp>-<type>/ with k6.log, summary.json,
+# meta.json and the applied Job manifest. These are the evidence a result is
+# explained by, so they are deliberately not cleaned up by the runners - but they
+# are per-run output and do not belong in git. Accepted numbers live in baselines/.
+results/
+
+# Per-run kustomize overlays, regenerated from k8s/base on every deploy.
+k8s/.generated/

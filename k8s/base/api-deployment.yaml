@@ -1,0 +1,75 @@
+# The API under test.
+#
+# Everything in this file is part of the measured configuration. The CPU limit
+# below is as much "the experiment" as the load profile is: change it and your
+# results are no longer comparable with earlier runs. If you want to know how the
+# app behaves with more CPU, that is a separate, recorded change.
+#
+# The image is deliberately a placeholder. Set the real image with a kustomize
+# overlay (k8s/overlays/local, or the overlay that scripts/deploy-and-test.ps1
+# generates for a run) so that the image reference - ideally a digest - is
+# recorded with the result instead of being patched in out of band.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-deployment
+  labels:
+    app: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: your-aspnet-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # One environment, declared once. The container must run with the
+            # same configuration it runs with in production: a Debug build or a
+            # Development environment turns the numbers into fiction.
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+          # Probes are part of the test harness, not just Kubernetes hygiene.
+          # Without them `kubectl rollout status` reports the deployment ready as
+          # soon as the container is running, so the load test starts before
+          # Kestrel is listening and the first requests fail for a reason that
+          # has nothing to do with performance.
+          #
+          # These are TCP probes, so they need no knowledge of your routes. They
+          # prove the port is open, not that the app is warm: if your API has a
+          # health/readiness endpoint (or runs migrations on start-up), switch to
+          # httpGet against it, which is strictly better.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

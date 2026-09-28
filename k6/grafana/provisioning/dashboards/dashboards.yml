@@ -1,0 +1,19 @@
+# Grafana dashboard provider: loads every dashboard JSON in the mounted folder.
+#
+# The compose file mounts ./grafana/dashboards at /var/lib/grafana/dashboards, so
+# anything dropped in that folder appears in Grafana on start (and is reloaded every
+# 30s). Add your own dashboards there; imports done through the UI land in Grafana's
+# own database instead, which lives in the grafana-data volume.
+apiVersion: 1
+
+providers:
+  - name: perf-test-kit
+    orgId: 1
+    folder: perf-test-kit
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

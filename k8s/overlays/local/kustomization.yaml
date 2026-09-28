@@ -1,0 +1,22 @@
+# Local, single-node cluster (Docker Desktop Kubernetes, kind, minikube).
+#
+#   kubectl apply -k k8s/overlays/local
+#
+# This overlay is for poking at the deployment by hand. Real runs go through
+# scripts/deploy-and-test.ps1, which generates an overlay of exactly this shape
+# but with the image, replicas and environment of that run written into it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: perf-test
+
+resources:
+  - ../../base
+  - namespace.yaml
+
+images:
+  # `name` must match the placeholder in k8s/base, so that the transformer
+  # rewrites it rather than appending a second entry.
+  - name: your-aspnet-api
+    newName: exchangeportal-finance-api
+    newTag: local
