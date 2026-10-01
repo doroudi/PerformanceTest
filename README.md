@@ -26,7 +26,7 @@ version of this kit violated all three:
 | Where k6 runs | docker compose, on your machine | a Kubernetes Job, in the cluster |
 | Use it for | writing and debugging scenarios; "does the script work" | every number you intend to act on |
 | Target must be | reachable from a container (`host.docker.internal`, not `localhost`) | in-cluster DNS (`http://api-service:8080/...`) |
-| Observability | Grafana + Prometheus via compose (k6 remote-writes into Prometheus) | `results/<run>/` artefacts (see below) |
+| Observability | Grafana + Prometheus via compose: the **k6 load test** dashboard, plus `results/<run>/` artefacts (see below) | `results/<run>/` artefacts (see below) |
 
 Both write `results/<timestamp>-<type>/{k6.log,summary.json,meta.json}`, so a local
 run and a cluster run are compared the same way.
@@ -246,7 +246,8 @@ pwsh -File scripts/deploy-and-test.ps1 -TargetUrl http://api-service:8080/api/he
 | Latency is flat and suspiciously good | You are probably not load-testing the app: check what the endpoint actually does. |
 | Exit code 99 | Thresholds crossed - a real finding. Expected for stress and spike. |
 | Local run cannot resolve the target | The runner now **rejects** a `localhost`/`127.0.0.1` target instead of warning: inside the container that is the container itself, and every request fails in ~2ms. Use `host.docker.internal`, or `-AllowLocalhostTarget` if you truly mean the k6 container. |
-| Local run works but Grafana shows no data | Three things must all hold: k6 has an output enabled (`K6_OUT`, not just `K6_PROMETHEUS_RW_SERVER_URL` - the URL alone sends nothing), Prometheus accepts remote writes (`--web.enable-remote-write-receiver`), and Grafana has a provisioned datasource (an empty `grafana/provisioning/` means none). Check <http://localhost:9090/graph> first - see `k6/README.md`. |
+| Local run works but Grafana shows no data | In order of likelihood: (1) **the time range no longer covers the run** - k6 writes samples only while the test runs, so a finished run is invisible to an instant query at "now"; use the Grafana link the runner prints, or widen the range; (2) k6 has no output enabled (`K6_OUT`, not just `K6_PROMETHEUS_RW_SERVER_URL` - the URL alone sends nothing); (3) Grafana has more than one datasource, or none (a hand-added Prometheus with an empty URL breaks every panel); (4) Prometheus rejects remote writes (needs `--web.enable-remote-write-receiver`, plus `--enable-feature=native-histograms` for the histogram pushes). Check <http://127.0.0.1:9090/graph> first - see `k6/README.md`. |
+| `http://localhost:3000` hangs | Docker Desktop publishes these ports on IPv6 too, and its IPv6 proxy does not answer on this machine: `127.0.0.1` works, `localhost`/`[::1]` time out. Every documented URL now uses `127.0.0.1`. |
 
 ## What changed (P0: making the numbers trustworthy)
 
@@ -304,15 +305,71 @@ pwsh -File scripts/deploy-and-test.ps1 -TargetUrl http://api-service:8080/api/he
 7. **k6-operator and distributed load.** Replace the hand-rolled Job with a
    `TestRun` resource when a single generator caps out, and add chaos/HPA-validation
    scenarios.
-8. **Decide the fate of the two InfluxDB-era dashboards** in `k6/dashboards/`. They
-   contain InfluxQL queries against a `k6influxdb` datasource and cannot work against
-   Prometheus; they are no longer mounted. `14801_rev2.json` is additionally broken
-   even for InfluxDB, because it uses `${DS_DUMMY}`, an import-time placeholder that
-   file provisioning does not resolve.
-9. **Align the generator version.** `k6/Dockerfile` pins k6 1.3.0 for cluster runs
-   while `docker-compose.yml` pins 0.54.0 locally (and the remote-write output name
-   differs between those lines). A different generator version is a different
-   experiment.
+8. ~~**Decide the fate of the two InfluxDB-era dashboards** in `k6/dashboards/`.~~
+   **Done.** They were InfluxQL against a `k6influxdb` datasource and could not work
+   against Prometheus, so they and the orphaned `k6-influxdb-1` container are gone.
+9. ~~**Align the generator version.**~~ **Done**, and the reason given here was wrong:
+   `experimental-prometheus-rw` is accepted by **both** k6 0.54.0 and 1.3.0 (verified by
+   asking each image to list its output types), so the pin could be raised without
+   touching the output name. Both files now pin 1.3.0.
+
+## Grafana, or a result file?
+
+Both. They answer different questions, and neither replaces the other:
+
+| | Grafana + Prometheus (live) | `results/<run>/` (durable) |
+|---|---|---|
+| Answers | "what is happening *now*", and how this run compares to the last five | "exactly what did *this* run measure" |
+| Lifetime | 7-day retention, then gone | permanent, diffable, reviewable |
+| Needed for | watching a run, finding the knee, spotting soak drift, overlaying runs | CI gates, audits, regression detection, post-mortems |
+| Cannot do | gate a pull request; survive a volume wipe | show the *shape* of a two-hour soak |
+
+A dashboard cannot gate a pull request and a JSON file cannot show you a rising tail
+at minute 90. The kit keeps both: every run writes `summary.json`/`meta.json`, and the
+same run streams into Prometheus and appears on the dashboard.
+
+## Local observability: what was broken
+
+The Prometheus/Grafana path was reported as "works with InfluxDB, not with
+Prometheus". It was investigated on the real stack rather than by reading, and the
+sink was never the problem - k6's metrics were arriving, and 61 `k6_*` metric names
+were sitting in Prometheus. Five separate defects made it *look* dead:
+
+1. **The dashboard's time range did not cover the run** - by far the most important.
+   k6 writes samples only while a test runs. Evaluating the dashboard's own queries at
+   a run's timestamp returned 56 metric names and `0.83 req/s`; evaluating the same
+   queries at "now", after the run, returned **zero series**. Every panel said "No
+   data" and the pipeline was pronounced broken. Fixed by a wide default range and,
+   properly, by having the runner print a link pinned to the run's exact window.
+2. **`localhost` hangs on this machine.** `http://127.0.0.1:9090` answers;
+   `http://localhost:9090` and `http://[::1]:9090` time out, because Docker Desktop
+   also publishes on IPv6 and its IPv6 proxy does not respond. A browser falls back to
+   IPv4 and looks fine, so only scripts and health checks hung. All ports are now bound
+   to `127.0.0.1`, and every documented URL uses it.
+3. **Two datasources, one of them broken.** A hand-added `prometheus` with an *empty*
+   URL sat next to the provisioned one. The old README told you to import dashboard
+   19665 by hand, and that import binds to whatever datasource it likes - including
+   this one, which renders every panel empty. The duplicate is deleted and the kit now
+   ships its own dashboard instead of pointing at Grafana.com.
+4. **Cumulative latency statistics.** k6's gauge trend stats are cumulative over the
+   run: measured across 67 samples of one run, `k6_http_req_duration_p95` held a single
+   value (`0.0243`) and `_max` never moved. They converge and then stop, so a spike or
+   a slow soak drift is invisible - the exact signal a soak exists to find. k6 now
+   pushes **native histograms**, and the dashboard reads
+   `histogram_quantile(0.95, sum(rate(k6_http_req_duration_seconds[...])))`, which on
+   the same kind of run returns a real moving series (`52.56, 131.79, 198.43, ...`).
+   The panels fall back to the gauges automatically if histograms are switched off.
+5. **`test_type` never reached Prometheus.** A tag set in a scenario's `options.tags`
+   does not arrive, while the same tag passed as a CLI `--tag` does. Both runners now
+   pass it on the command line, so the dashboard's test-type filter works.
+
+Also fixed while in here: `-EnvVars A=1,B=2` was broken under `pwsh -File` (which does
+not split commas), so the README's own example fed k6 a single malformed value; and the
+orphaned `k6-influxdb-1` container plus the two dead InfluxQL dashboards are gone,
+which removes the orphan warning from every run.
+
+The kit now also ships a **demo target** (`traefik/whoami`, always up), so "is the kit
+broken or is my API broken?" is a one-command question.
 
 ## Rules worth writing on the wall
 

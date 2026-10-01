@@ -8,3 +8,12 @@ results/
 
 # Per-run kustomize overlays, regenerated from k8s/base on every deploy.
 k8s/.generated/
+
+# Publish output for the application image.
+#
+# Ignored for a security reason as much as a hygiene one: the publish folder is where
+# the application's own .env is written so the container can reach HashiCorp Vault, and
+# that file contains a live Vault token. An untracked-but-not-ignored .build/ is one
+# `git add -A` away from committing a credential.
+.build/
+results/

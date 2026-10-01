@@ -21,6 +21,14 @@
     or "127.0.0.1", which would be the k6 container itself. To reach something
     running on your machine use http://host.docker.internal:<port>.
 
+    The target does NOT have to run in Docker. k6 runs in a container here; the
+    API it tests can be any process on this machine - `dotnet run`, node, IIS
+    Express, a Windows service. So for a service on port 5180:
+
+        -TargetUrl http://host.docker.internal:5180/healthz
+
+    Only the host name differs from what you would type in a browser.
+
     Whether a service bound only to 127.0.0.1 answers through that name depends on
     the host: Docker Desktop proxies to this machine's loopback, so it works as-is,
     while native Linux Docker routes to the bridge and the service must also bind
@@ -34,6 +42,11 @@
 
 .EXAMPLE
     ./k6/run-test.ps1 -TargetUrl http://host.docker.internal:5000/api/health -TestType smoke
+
+.EXAMPLE
+    # An API started with `dotnet run` on this machine, bound to loopback only.
+    ./k6/run-test.ps1 -TargetUrl http://host.docker.internal:5180/healthz -TestType load `
+      -EnvVars TARGET_VUS=50,RAMP_DURATION=1m,HOLD_DURATION=5m
 #>
 [CmdletBinding()]
 param(
@@ -158,25 +171,32 @@ function Get-HostTargetHint {
 }
 
 if ($loopbackReason) {
+    # Show the exact URL to use instead, not a template. The reader has just
+    # typed a command; making them do the <port><path> substitution themselves is
+    # how this message gets read as "your setup is unsupported" instead of "one
+    # word in your command is wrong".
+    $suggestedUrl = [regex]::Replace(
+        $TargetUrl,
+        '^(?<scheme>[A-Za-z]+://)(?<host>[^/:?#]+)',
+        '${scheme}host.docker.internal')
+
     $message = ("TargetUrl '$TargetUrl' cannot work from inside the k6 container: $loopbackReason, " +
         "not your machine.$malformedHint Every request fails in milliseconds and the test measures nothing - " +
-        'and although the failures do appear in the metrics, there is nothing in the summary that names the cause. ' +
-        'To reach a service running on your machine use http://host.docker.internal:<port><path>. ' +
+        'and although the failures do appear in the metrics, there is nothing in the summary that names the cause.' +
+        "`n  Use: $suggestedUrl" +
+        "`n  Only the host name changes; the scheme, port and path stay exactly as they are." + "`n" +
+        'Your API does NOT need to run in Docker. k6 runs in a container here, but the thing being tested can be ' +
+        'any process on this machine - `dotnet run`, node, IIS Express, a Windows service. That is the normal case, ' +
+        'and it is precisely what host.docker.internal exists for. ' +
         "$(Get-HostTargetHint) " +
-        'Pass -AllowLocalhostTarget only if the target really is inside the k6 container.')
+        'Pass -AllowLocalhostTarget only if the target really is inside the k6 container itself.')
     if (-not $AllowLocalhostTarget) {
         throw $message
     }
     Write-Warning $message
 }
 
-$testEnv = @{}
-foreach ($entry in $EnvVars) {
-    if ($entry -notmatch '^(?<name>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$') {
-        throw "EnvVars entries must look like NAME=value, but got '$entry'."
-    }
-    $testEnv[$Matches['name']] = $Matches['value']
-}
+$testEnv = ConvertTo-PerfTestEnvTable -EnvVars $EnvVars
 
 # docker compose v2 (plugin) vs the standalone v1 binary.
 $composeExecutable = 'docker'
@@ -219,14 +239,24 @@ function Invoke-Compose {
     }
 }
 
+# 127.0.0.1 and never `localhost`. Docker Desktop also publishes these ports on
+# IPv6, and its IPv6 proxy does not answer on at least this machine, so a
+# `localhost` URL hangs until something times out instead of failing fast. Both
+# were measured: http://127.0.0.1:9090 answered immediately while
+# http://[::1]:9090 and http://localhost:9090 timed out. A browser eventually
+# falls back to IPv4 and appears to work, which is why this was never obvious.
+$grafanaUrl = 'http://127.0.0.1:3000'
+$prometheusUrl = 'http://127.0.0.1:9090'
+$dashboardUid = 'k6-load-test'
+
 if (-not $NoStack) {
-    Write-Host 'Starting Prometheus and Grafana...' -ForegroundColor Cyan
-    $stackExit = Invoke-Compose -Arguments @('up', '-d', 'prometheus', 'grafana')
+    Write-Host 'Starting Prometheus, Grafana and the demo target...' -ForegroundColor Cyan
+    $stackExit = Invoke-Compose -Arguments @('up', '-d', 'prometheus', 'grafana', 'demo-target')
     if ($stackExit -ne 0) {
-        throw "'$composeExecutable $($composePrefix -join ' ') up -d prometheus grafana' failed with exit code $stackExit."
+        throw "'$composeExecutable $($composePrefix -join ' ') up -d prometheus grafana demo-target' failed with exit code $stackExit."
     }
-    Write-Host 'Grafana:    http://localhost:3000/d/perf-kit-ingest-check  (is data arriving?)' -ForegroundColor Cyan
-    Write-Host 'Prometheus: http://localhost:9090/graph  (query k6 metrics here)' -ForegroundColor Cyan
+    Write-Host "Grafana:    $grafanaUrl/d/$dashboardUid  (this run's results)" -ForegroundColor Cyan
+    Write-Host "Prometheus: $prometheusUrl/graph  (raw k6 metrics)" -ForegroundColor Cyan
 }
 
 $runDirectory = New-PerfTestRunDirectory -ResultsRoot $resultsRoot -Name $TestType
@@ -250,10 +280,18 @@ foreach ($name in ($testEnv.Keys | Sort-Object)) {
 #
 # `--tag testid=` labels this run's series so Grafana panels and PromQL can be
 # filtered to one run.
+#
+# `--tag test_type=` is passed HERE, from the runner, and not left to the
+# scenarios' own `options.tags`. Measured on a real run: the tag set inside
+# `options.tags` in a scenario file does NOT reach Prometheus at all - the
+# k6_* series carried testid but no test_type label - while the same tag passed
+# as a CLI --tag arrived as test_type="probe". Without this line the dashboard's
+# test-type filter silently matches nothing.
 $runArguments += @(
     'k6',
     'run',
     '--tag', "testid=$testId",
+    '--tag', "test_type=$TestType",
     "/scripts/$scenarioFile"
 )
 
@@ -283,7 +321,7 @@ if (-not $SkipPreflight -and $TestType -ne 'smoke') {
     $preflightArgs = @('run', '--rm')
     $preflightArgs += @('-e', "TARGET_URL=$TargetUrl")
     $preflightArgs += @('-e', 'TARGET_VUS=1', '-e', 'TEST_DURATION=4s', '-e', 'REQUEST_PAUSE=0')
-    $preflightArgs += @('k6', 'run', '--tag', "testid=$testId-preflight", '/scripts/smoke-test.js')
+    $preflightArgs += @('k6', 'run', '--tag', "testid=$testId-preflight", '--tag', 'test_type=preflight', '/scripts/smoke-test.js')
 
     Write-Host 'Preflight: checking the target answers from inside the container...' -ForegroundColor Cyan
     $previous = $ErrorActionPreference
@@ -394,6 +432,40 @@ Write-Host "  log      : $logPath"
 Write-Host "  summary  : $summaryPath"
 Write-Host "  metadata : $metaPath"
 Write-Host "  testid   : $testId  (filter Grafana panels with this)"
+
+# A link that opens Grafana on THIS run.
+#
+# This is the fix for the single most common complaint about this kit - "Grafana
+# shows no data". The metrics were always delivered; the dashboard's own time
+# range simply no longer covered a run that had finished. k6 writes samples only
+# while the test is running, so once the run stops, an instant query at "now"
+# returns nothing and every panel reads "No data". Measured on the real stack:
+# the dashboard's own queries returned 56 metric names and 0.83 req/s when
+# evaluated at the run's timestamp, and zero series when evaluated at "now".
+#
+# Pinning from/to to the measured window (+/- 10s of slack for the first and
+# last push) removes that failure mode entirely. The var-testid and var-test_type
+# parameters pre-select the template variables, so the link shows exactly one run.
+# NOTE: the window is read with Get-PerfTestSummaryWindow, NOT from
+# $summary.started_at. ConvertFrom-Json has already turned those fields into
+# [datetime] objects, and re-parsing them loses the zone designator and makes
+# them LOCAL time - measured at exactly this machine's UTC offset (+03:30), which
+# pointed the dashboard 3.5 hours before a run whose metrics were sitting in
+# Prometheus the whole time. The helper regexes the raw ISO strings instead.
+$window = Get-PerfTestSummaryWindow -Path $summaryPath
+if ($window) {
+    $fromMs = $window.StartedAt.ToUnixTimeMilliseconds() - 10000
+    $toMs = $window.EndedAt.ToUnixTimeMilliseconds() + 10000
+    $grafanaLink = ('{0}/d/{1}?from={2}&to={3}&var-testid={4}&var-test_type={5}' -f `
+            $grafanaUrl, $dashboardUid, $fromMs, $toMs, $testId, $TestType)
+    Write-Host ''
+    Write-Host 'Grafana (this run, already zoomed to its window):' -ForegroundColor Cyan
+    Write-Host "  $grafanaLink"
+}
+else {
+    Write-Warning ("No usable time window in $summaryPath, so no Grafana link was built. " +
+        "Open $grafanaUrl/d/$dashboardUid and set the range to cover this run.")
+}
 
 if ($exitCode -eq 99) {
     Write-Host ''

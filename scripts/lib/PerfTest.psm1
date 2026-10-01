@@ -191,6 +191,100 @@ function Write-PerfTestMetadata {
     return (Write-Utf8NoBom -Path $Path -Content $json)
 }
 
+function ConvertTo-PerfTestEnvTable {
+    <#
+    Parse a -EnvVars argument into a name -> value table.
+
+    Both documented invocation styles must behave identically:
+
+        # in-process: PowerShell splits the commas itself
+        ./k6/run-test.ps1  -EnvVars TARGET_VUS=20,HOLD_DURATION=5m
+
+        # pwsh -File: PowerShell does NOT split the commas
+        pwsh -File k6/run-test.ps1 -EnvVars TARGET_VUS=20,HOLD_DURATION=5m
+
+    The second form is the one every README example uses, and it delivers the
+    whole "TARGET_VUS=20,HOLD_DURATION=5m" as a SINGLE array element. A runner
+    that only iterated the array therefore set TARGET_VUS to the string
+    "20,HOLD_DURATION=5m" and handed k6 a number that was not a number - which
+    surfaced as `TARGET_VUS must be a non-negative number, but got
+    "20,HOLD_DURATION=5m"`, a message that points at the scenario file rather
+    than at the argument parsing. Splitting every element on commas makes the
+    two styles agree.
+
+    Consequence worth knowing: a value cannot itself contain a comma. None of
+    the scenario knobs do.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]] $EnvVars = @()
+    )
+
+    $table = @{}
+    foreach ($element in $EnvVars) {
+        foreach ($part in ("$element" -split ',')) {
+            $entry = $part.Trim()
+            if ($entry -eq '') {
+                continue
+            }
+            if ($entry -notmatch '^(?<name>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$') {
+                throw ("EnvVars entries must look like NAME=value, but got '{0}'. " +
+                    'Separate several entries with commas: -EnvVars TARGET_VUS=20,HOLD_DURATION=5m' -f $entry)
+            }
+            $table[$Matches['name']] = $Matches['value']
+        }
+    }
+
+    return $table
+}
+
+function Get-PerfTestSummaryWindow {
+    <#
+    Read the run's started_at / ended_at out of a summary.json WITHOUT letting
+    PowerShell coerce them into [datetime].
+
+    Why this exists: ConvertFrom-Json silently converts an ISO 8601 string to a
+    [datetime]. That value then stringifies in the current culture - on this
+    machine "2026-10-01T08:39:30.123Z" became "10/01/2026 08:39:30" - and
+    re-parsing a string with no zone designator left makes it LOCAL time. The
+    effect was a Grafana link whose time window was shifted by the machine's UTC
+    offset (+03:30 here): the run's metrics existed, but the dashboard was
+    looking 3.5 hours earlier and every panel read "No data".
+
+    Regex against the raw file keeps exactly the string k6 wrote. Returns $null
+    rather than throwing when the fields are absent or unparseable, so callers
+    can fall back.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        return $null
+    }
+
+    $text = Get-Content -Path $Path -Raw
+    $startMatch = [regex]::Match($text, '"started_at"\s*:\s*"(?<v>[^"]+)"')
+    $endMatch = [regex]::Match($text, '"ended_at"\s*:\s*"(?<v>[^"]+)"')
+    if (-not $startMatch.Success -or -not $endMatch.Success) {
+        return $null
+    }
+
+    $startedAt = [DateTimeOffset]::MinValue
+    $endedAt = [DateTimeOffset]::MinValue
+    $startOk = [DateTimeOffset]::TryParse($startMatch.Groups['v'].Value, [ref]$startedAt)
+    $endOk = [DateTimeOffset]::TryParse($endMatch.Groups['v'].Value, [ref]$endedAt)
+    if (-not $startOk -or -not $endOk) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        StartedAt = $startedAt
+        EndedAt   = $endedAt
+    }
+}
+
 function Get-PerfTestGitRevision {
     [CmdletBinding()]
     param()
@@ -262,6 +356,8 @@ Export-ModuleMember -Function @(
     'Get-K6SummaryFromText',
     'Get-K6SummaryFromFile',
     'Write-PerfTestMetadata',
+    'ConvertTo-PerfTestEnvTable',
+    'Get-PerfTestSummaryWindow',
     'Get-PerfTestGitRevision',
     'Invoke-Kubectl'
 )

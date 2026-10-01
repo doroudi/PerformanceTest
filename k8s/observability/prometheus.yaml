@@ -1,0 +1,177 @@
+# In-cluster Prometheus for load-test runs.
+#
+# Two jobs, and only one of them is about k6:
+#
+#   1. kubelet/cAdvisor - the APPLICATION's own resource behaviour, which is what
+#      turns "the load test got slower" into "the pod hit its CPU limit and was
+#      throttled". This is the part a k6-only dashboard can never show you.
+#   2. k6 itself, which remote-writes into this Prometheus from the load-generator
+#      Job (see the --web.enable-remote-write-receiver flag below).
+#
+# kube-state-metrics is deliberately NOT deployed. Everything this kit needs from
+# it is either already in cAdvisor (CPU, memory, throttling, limits) or is not
+# used yet (HPA status, restart counts). Fewer moving parts on a local cluster.
+# Note also that registry.k8s.io is unreachable from this network, so pulling
+# KSM's official image would fail anyway; the images used here are on Docker
+# Hub/MCR and are already cached locally.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: perf-observability
+data:
+  prometheus.yml: |
+    global:
+      # 5s, not the usual 15s. A load test is a short, sharp event: a 15s scrape
+      # interval cannot show the moment a pod crossed its CPU limit, and lining
+      # k6 samples up against pod CPU is the whole point of this stack.
+      scrape_interval: 5s
+      scrape_timeout: 4s
+      external_labels:
+        cluster: minikube-perf
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # Pod and container resource usage, straight from each node's kubelet.
+      # Everything is scraped through the API server proxy, so no host ports need
+      # to be reachable from this pod.
+      - job_name: kubelet-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+        # cAdvisor exposes thousands of series per node. Keeping only the ones the
+        # dashboard uses keeps this Prometheus small enough to run beside the app
+        # it is measuring - which matters, because a metrics stack that competes
+        # for CPU changes the result it is reporting.
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: "container_cpu_usage_seconds_total|container_cpu_cfs_throttled_periods_total|container_cpu_cfs_periods_total|container_cpu_cfs_throttled_seconds_total|container_memory_working_set_bytes|container_memory_rss|container_spec_cpu_quota|container_spec_cpu_period|container_spec_memory_limit_bytes|container_network_receive_bytes_total|container_network_transmit_bytes_total|container_last_seen|container_start_time_seconds|machine_cpu_cores|machine_memory_bytes"
+            action: keep
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: perf-observability
+---
+# Reading node metrics goes through the API server proxy, which needs node and
+# nodes/proxy access. Without nodes/proxy the scrape fails with a 403 and the pod
+# panels are simply empty, with the reason only visible in Prometheus's own log.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: perf-test-prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "nodes/metrics", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: perf-test-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: perf-test-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: perf-observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: perf-observability
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            # Without this the k6 Job's remote writes are rejected and Grafana has
+            # nothing to show, with no error on the k6 side that names the cause.
+            - --web.enable-remote-write-receiver
+            # Required because k6 pushes trends as native histograms, which is what
+            # makes per-interval percentiles possible instead of k6's cumulative
+            # gauge statistics.
+            - --enable-feature=native-histograms
+            - --storage.tsdb.retention.time=3d
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            # Memory limit only. Deliberately no CPU limit: throttling the metrics
+            # stack would corrupt the measurements it exists to explain.
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: perf-observability
+  labels:
+    app: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      # NodePort so the host browser can reach it at http://127.0.0.1:30090
+      nodePort: 30090
+  type: NodePort

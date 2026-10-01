@@ -33,7 +33,7 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
 
-import { USER_AGENT, TREND_STATS, envNumber, envString, requireTargetUrl } from "./lib/env.js";
+import { USER_AGENT, TREND_STATS, buildRequestHeaders, envNumber, envString, requireTargetUrl } from "./lib/env.js";
 import { makeHandleSummary } from "./lib/summary.js";
 
 const testType = "soak";
@@ -67,7 +67,12 @@ export const options = {
 
 export default function () {
   const response = http.get(targetUrl, {
-    headers: { Accept: "application/json" },
+    // Built per iteration rather than once per VU. With AUTH_TOKEN_URL configured
+    // that is what lets a long run pick up a RENEWED token instead of sending an
+    // expired one for the rest of the test. It is cheap: the static headers are
+    // parsed once at module load, and the token is read from a cache until it needs
+    // renewing.
+    headers: buildRequestHeaders(),
   });
 
   check(response, {

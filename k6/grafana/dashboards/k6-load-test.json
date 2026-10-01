@@ -1,0 +1,438 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Load-test results for a k6 run. Latency panels prefer Prometheus native histograms (true per-interval percentiles) and fall back to k6's gauge trend statistics automatically, so this dashboard works whether or not native histograms are enabled.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "tags": ["k6", "perf-test-kit"],
+      "targetBlank": false,
+      "title": "Other perf-test-kit dashboards",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Highest number of concurrent virtual users observed in the selected time range. This is the load that was actually offered.",
+      "fieldConfig": {
+        "defaults": { "decimals": 0, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["max"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(max_over_time(k6_vus{testid=~\"$testid\", test_type=~\"$test_type\"}[$__range]))",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Peak virtual users",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Total requests completed. k6_http_reqs_total is a counter, so its last value over the range is the run total.",
+      "fieldConfig": {
+        "defaults": { "decimals": 0, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["max"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(max_over_time(k6_http_reqs_total{testid=~\"$testid\", test_type=~\"$test_type\"}[$__range]))",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Total requests",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "95th percentile of request duration over the whole selected range. Native histogram when available, otherwise k6's cumulative gauge.",
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "unit": "ms" },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_duration_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__range]))) * 1000 or max(max_over_time(k6_http_req_duration_p95{testid=~\"$testid\", test_type=~\"$test_type\"}[$__range])) * 1000",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "p95 latency",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Worst failure ratio seen in the range, as a percentage of requests. k6_http_req_failed_rate is already a 0..1 ratio, not a counter.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["max"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(max_over_time(k6_http_req_failed_rate{testid=~\"$testid\", test_type=~\"$test_type\"}[$__range])) * 100",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Peak failure rate",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "The load profile k6 was asked to produce. A flat top is a hold; a step is a stress plateau; a narrow block is a spike. If this line does not look like your scenario's stages, the run did not do what you think it did.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (testid) (k6_vus{testid=~\"$testid\", test_type=~\"$test_type\"})",
+          "legendFormat": "{{testid}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Load profile - virtual users",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Achieved request rate. Compare against the rate the scenario asked for: in a closed (VU-based) model this falls when the target slows down, which is the classic sign you are measuring the wrong thing.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))",
+          "legendFormat": "requests/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Per-interval latency percentiles (native histograms). This is the panel to watch on a soak: a flat average can hide a steadily worsening tail. In gauge mode the fallback lines are CUMULATIVE over the run and converge, so they cannot show drift - see the notes panel below.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": ["max", "mean", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(k6_http_req_duration_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000 or max by (testid) (k6_http_req_duration_p99{testid=~\"$testid\", test_type=~\"$test_type\"}) * 1000",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_duration_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000 or max by (testid) (k6_http_req_duration_p95{testid=~\"$testid\", test_type=~\"$test_type\"}) * 1000",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum(rate(k6_http_req_duration_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000 or max by (testid) (k6_http_req_duration_med{testid=~\"$testid\", test_type=~\"$test_type\"}) * 1000",
+          "legendFormat": "p50 (median)",
+          "refId": "C"
+        }
+      ],
+      "title": "Latency percentiles",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Failures are HTTP errors and failed check() assertions. Stress and spike tests are SUPPOSED to push these up; load and soak tests are not.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "max": 100,
+          "min": 0,
+          "unit": "percent",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 13 },
+      "id": 8,
+      "options": {
+        "legend": { "calcs": ["max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (testid) (k6_http_req_failed_rate{testid=~\"$testid\", test_type=~\"$test_type\"}) * 100",
+          "legendFormat": "failed requests %",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (testid) (k6_checks_rate{testid=~\"$testid\", test_type=~\"$test_type\"}) * 100",
+          "legendFormat": "checks passed %",
+          "refId": "B"
+        }
+      ],
+      "title": "Correctness - failures and checks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Completed iterations per second. For a one-request script this tracks the request rate; for a multi-step journey it is the only figure that reflects the whole user journey.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
+      "id": 9,
+      "options": {
+        "legend": { "calcs": ["max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(k6_iterations_total{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))",
+          "legendFormat": "iterations/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Iterations per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Bytes per second received and sent by the generator. A soak that slowly grows here is a leak in the response path; a sudden change means the payload changed.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "unit": "Bps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": ["max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(k6_data_received_total{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))",
+          "legendFormat": "received",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(k6_data_sent_total{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))",
+          "legendFormat": "sent",
+          "refId": "B"
+        }
+      ],
+      "title": "Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Where the time inside a request went. 'waiting' is server think time - if it dominates, the target is the problem. 'connecting'/'sending'/'receiving' dominating points at the network or the generator instead. Requires native histograms.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": ["max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_waiting_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "waiting (server think time)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_connecting_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "connecting",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_receiving_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "receiving",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_sending_seconds{testid=~\"$testid\", test_type=~\"$test_type\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "sending",
+          "refId": "D"
+        }
+      ],
+      "title": "Where the request time went (p95)",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": { "h": 13, "w": 24, "x": 0, "y": 30 },
+      "id": 12,
+      "options": {
+        "content": "## Reading this dashboard\n\n**Pick a run.** Use the `run (testid)` selector at the top. Every run is tagged\n`testid=<utc timestamp>-<type>`, and the runner prints a ready-made link that opens\nthis dashboard already zoomed to that run's exact window and filtered to its testid.\nUse it: it is the difference between \"Grafana is broken\" and \"I was looking at the\nlast 30 minutes\".\n\n**Why a panel can look empty.** k6 only writes samples *while the test is running*.\nIt pushes every 2s and once more at the end, and then the series simply stops. So:\n\n| You see | Because |\n|---|---|\n| Nothing, before you start | There is no run yet - that is correct |\n| Nothing, minutes after a run | The time range no longer covers the run. Widen it, or use the runner's link |\n| Nothing, while a run is in progress | The first push takes ~2s; also check the k6 log for remote-write errors |\n| Only the last run | The `testid` selector is set to one value - set it to `All` to overlay runs |\n\n**Latency percentiles: two modes.** These panels prefer\n`histogram_quantile(...rate(k6_http_req_duration_seconds...))`, i.e. Prometheus\n**native histograms**, which give true per-interval percentiles. If native\nhistograms are off, they fall back (`or`) to k6's gauge statistics\n(`k6_http_req_duration_p95`) - and those are **cumulative over the run**: they\nconverge within seconds and then stop moving, so they cannot show a spike or a\nslow drift. A flat latency line in gauge mode is not evidence that latency was\nflat.\n\nTo enable native histograms:\n\n- `k6/docker-compose.yml` - `K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM=true`\n- Prometheus needs `--enable-feature=native-histograms` (already set in the compose command)\n\n## When there is no data at all\n\nWork down this list - it isolates the broken layer.\n\n1. **Did k6 send anything?** <http://127.0.0.1:9090/api/v1/label/__name__/values> - search for `k6_`.\n   Nothing there means the problem is the k6 output, not Grafana.\n2. **Did the run report a push error?** `results/<run>/k6.log` - k6 writes remote-write\n   failures as `level=error`. A missing `--enable-feature=native-histograms` shows up here.\n3. **Is the datasource right?** <http://127.0.0.1:3000/connections/datasources> - there must be\n   exactly one `Prometheus` pointing at `http://prometheus:9090`. A second, hand-made\n   datasource with no URL renders every panel empty.\n4. **Use `127.0.0.1`, not `localhost`.** Docker Desktop publishes on IPv6 as well, and\n   its IPv6 proxy does not answer here, so `http://localhost:3000` hangs while\n   `http://127.0.0.1:3000` works.\n\n## What this dashboard is not\n\nIt shows the **generator's** view. It cannot tell you *why* the target was slow.\nFor that you need the target's own CPU, memory, GC and pool metrics on the same\ntimeline - see the \"Observability for the system under test\" item in the main README.",
+        "mode": "markdown"
+      },
+      "title": "How to use this dashboard",
+      "type": "text"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["k6", "perf-test-kit"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "includeAll": true,
+        "label": "run (testid)",
+        "multi": true,
+        "name": "testid",
+        "options": [],
+        "query": { "query": "label_values(k6_http_reqs_total, testid)", "refId": "testid" },
+        "refresh": 1,
+        "regex": "",
+        "sort": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "includeAll": true,
+        "label": "test type",
+        "multi": true,
+        "name": "test_type",
+        "options": [],
+        "query": { "query": "label_values(k6_http_reqs_total, test_type)", "refId": "test_type" },
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "k6 load test",
+  "uid": "k6-load-test",
+  "version": 1
+}

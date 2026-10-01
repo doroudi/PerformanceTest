@@ -78,6 +78,33 @@ param(
     # treat the results as suspect if you do.
     [string] $K6CpuRequest = '1',
 
+    # ---------------------------------------------------------------------
+    # The API container's CPU and memory. These are as much "the experiment" as
+    # the load profile is: "the app sustains X rps at p95 < Y" means nothing
+    # without the resources it was allowed. Two runs with different values are
+    # two different experiments, which is why they are recorded in meta.json.
+    #
+    # CPU limit in particular is the single most useful knob here, because a
+    # .NET app at its CPU limit throttles rather than queueing: that shows up as
+    # a latency cliff and as container_cpu_cfs_throttled_periods_total climbing
+    # on the pod dashboard.
+    # ---------------------------------------------------------------------
+    [string] $CpuRequest = '250m',
+    [string] $CpuLimit = '500m',
+    [string] $MemoryRequest = '256Mi',
+    [string] $MemoryLimit = '512Mi',
+
+    # Environment variables for the APPLICATION container, NAME=value, parsed the
+    # same way as -EnvVars. Deliberately separate from -EnvVars, which goes to the
+    # generator: one bag for both is how an application setting silently becomes a
+    # scenario knob (or the reverse) and nobody notices.
+    [string[]] $AppEnvVars = @(),
+
+    # Remote-write endpoint for the generator's metrics, e.g.
+    # http://prometheus.perf-observability.svc.cluster.local:9090/api/v1/write
+    # Empty means the Job exports nothing and only the artefacts are produced.
+    [string] $PrometheusWriteUrl = '',
+
     [int] $TimeoutSeconds = 1800,
     [string[]] $EnvVars = @(),
 
@@ -238,17 +265,32 @@ function New-PerfTestOverlay {
         [Parameter(Mandatory = $true)][string] $ImageReference,
         [Parameter(Mandatory = $true)][string] $PullPolicy,
         [Parameter(Mandatory = $true)][int] $ReplicaCount,
-        [Parameter(Mandatory = $true)][string] $Environment
+        [Parameter(Mandatory = $true)][string] $Environment,
+        [Parameter(Mandatory = $true)][string] $CpuRequest,
+        [Parameter(Mandatory = $true)][string] $CpuLimit,
+        [Parameter(Mandatory = $true)][string] $MemoryRequest,
+        [Parameter(Mandatory = $true)][string] $MemoryLimit,
+        [hashtable] $AppEnvironment = @{}
     )
 
     $image = Split-PerfTestImage -Reference $ImageReference
 
-    $imageEntry = @("    newName: $($image.Name)")
+    # Quoted deliberately. Unquoted, a purely numeric tag is emitted as
+    # `newTag: 1`, YAML parses that as an integer, and kustomize rejects the whole
+    # overlay with:
+    #
+    #   invalid Kustomization: json: cannot unmarshal number into Go struct field
+    #   Image.images.newTag of type string
+    #
+    # Numeric tags are perfectly legal in Docker - CI build numbers are the usual
+    # source of them - so the runner has to survive them rather than making the user
+    # rename their image.
+    $imageEntry = @("    newName: `"$($image.Name)`"")
     if ($image.Digest) {
-        $imageEntry += "    digest: $($image.Digest)"
+        $imageEntry += "    digest: `"$($image.Digest)`""
     }
     else {
-        $imageEntry += "    newTag: $($image.Tag)"
+        $imageEntry += "    newTag: `"$($image.Tag)`""
     }
 
     $kustomization = @(
@@ -295,6 +337,22 @@ function New-PerfTestOverlay {
         '          env:'
         '            - name: ASPNETCORE_ENVIRONMENT'
         "              value: `"$Environment`""
+    )
+    foreach ($name in ($AppEnvironment.Keys | Sort-Object)) {
+        $runtimeSettings += "            - name: $name"
+        $runtimeSettings += "              value: `"$($AppEnvironment[$name])`""
+    }
+    $runtimeSettings += @(
+        '          resources:'
+        '            requests:'
+        "              cpu: `"$CpuRequest`""
+        "              memory: `"$MemoryRequest`""
+        '            limits:'
+        # No memory headroom trickery here, and the CPU limit is emitted even when
+        # it equals the request: a .NET app that is CPU-limited throttles, and
+        # seeing that in Prometheus is the point of the exercise.
+        "              cpu: `"$CpuLimit`""
+        "              memory: `"$MemoryLimit`""
         ''
     )
 
@@ -317,7 +375,8 @@ function New-K6JobManifest {
         [Parameter(Mandatory = $true)][string] $GeneratorImage,
         [Parameter(Mandatory = $true)][string] $PullPolicy,
         [Parameter(Mandatory = $true)][string] $CpuRequest,
-        [Parameter(Mandatory = $true)][hashtable] $ScenarioEnv
+        [Parameter(Mandatory = $true)][hashtable] $ScenarioEnv,
+        [string] $PrometheusWriteUrl = ''
     )
 
     $envLines = @(
@@ -327,6 +386,23 @@ function New-K6JobManifest {
     foreach ($name in ($ScenarioEnv.Keys | Sort-Object)) {
         $envLines += "            - name: $name"
         $envLines += "              value: `"$($ScenarioEnv[$name])`""
+    }
+
+    # Metric export. K6_OUT is what enables an output at all - the remote-write URL
+    # on its own sends nothing, and the run then succeeds while writing no metrics.
+    # Native histograms are requested so the dashboard can compute true
+    # per-interval percentiles rather than k6's cumulative gauge statistics.
+    if ($PrometheusWriteUrl) {
+        $envLines += @(
+            '            - name: K6_OUT'
+            '              value: "experimental-prometheus-rw"'
+            '            - name: K6_PROMETHEUS_RW_SERVER_URL'
+            "              value: `"$PrometheusWriteUrl`""
+            '            - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM'
+            '              value: "true"'
+            '            - name: K6_PROMETHEUS_RW_PUSH_INTERVAL'
+            '              value: "2s"'
+        )
     }
 
     $manifest = @(
@@ -368,7 +444,10 @@ function New-K6JobManifest {
         '        - name: k6'
         "          image: $GeneratorImage"
         "          imagePullPolicy: $PullPolicy"
-        '          command: ["k6", "run", "/scripts/' + $Script + '"]'
+        # --tag test_type is set here rather than in the scenario's options.tags:
+        # measured on the compose stack, a tag set inside options.tags does not
+        # reach a metrics backend, while the same tag passed on the CLI does.
+        '          command: ["k6", "run", "--tag", "test_type=' + $TestType + '", "/scripts/' + $Script + '"]'
         '          env:'
     ) + $envLines + @(
         '          resources:'
@@ -453,6 +532,23 @@ function Publish-LocalImages {
                 Write-Warning "minikube context detected but the 'minikube' CLI is not on PATH. Load it manually: minikube image load $candidate"
                 continue
             }
+
+            # NOTE: `minikube image load` has no --nodes flag (checked against
+            # v1.37), so the image cannot be targeted at a specific node from here.
+            #
+            # The trap this leaves: the node's container runtime keys images by TAG,
+            # and with imagePullPolicy IfNotPresent a Job can be scheduled onto a
+            # node still holding the previous build of the same tag. k6 then fails
+            # with "the module /scripts/<file>.js couldn't be found on local disk"
+            # for a file that is plainly in k6/scripts and plainly inside the image
+            # on the host. Rebuilding does not fix it; the stale copy on the node
+            # has to go. Either:
+            #
+            #   docker exec <node> docker rmi -f <image>   # for each node, then re-run
+            #
+            # or, if that is fiddly, `minikube delete && minikube start` for a clean
+            # cluster. Bump the tag instead (-K6Image k6-custom:2) - a different tag
+            # is always a cache miss on every node, which is the cheapest fix of all.
             Write-Host "Loading $candidate into minikube..." -ForegroundColor Cyan
             Invoke-Checked 'minikube' @('image', 'load', $candidate)
         }
@@ -587,13 +683,8 @@ if ($TargetUrl -and $TargetUrl -match 'swagger') {
     Write-Warning "'$TargetUrl' looks like Swagger UI. That is a static HTML page, served by middleware that is normally disabled outside Development: it exercises neither your API logic nor your database. Point -TargetUrl at a real endpoint."
 }
 
-$testEnv = @{}
-foreach ($entry in $EnvVars) {
-    if ($entry -notmatch '^(?<name>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$') {
-        throw "EnvVars entries must look like NAME=value, but got '$entry'."
-    }
-    $testEnv[$Matches['name']] = $Matches['value']
-}
+$testEnv = ConvertTo-PerfTestEnvTable -EnvVars $EnvVars
+$appEnv = ConvertTo-PerfTestEnvTable -EnvVars $AppEnvVars
 
 if ($testEnv.ContainsKey('TARGET_URL')) {
     throw 'TARGET_URL cannot be set through -EnvVars: use -TargetUrl, which is validated and recorded.'
@@ -615,7 +706,8 @@ if ($EmitJobManifest) {
         -GeneratorImage $K6Image `
         -PullPolicy $ImagePullPolicy `
         -CpuRequest $K6CpuRequest `
-        -ScenarioEnv $testEnv | Out-Null
+        -ScenarioEnv $testEnv `
+        -PrometheusWriteUrl $PrometheusWriteUrl | Out-Null
 
     Write-Host "Wrote the Job manifest to $manifestPath" -ForegroundColor Cyan
     Write-Host 'Nothing was deployed and no test was run (-EmitJobManifest).' -ForegroundColor DarkGray
@@ -739,7 +831,12 @@ if (-not $TestOnly) {
         -ImageReference $Image `
         -PullPolicy $ImagePullPolicy `
         -ReplicaCount $Replicas `
-        -Environment $RuntimeEnvironment | Out-Null
+        -Environment $RuntimeEnvironment `
+        -CpuRequest $CpuRequest `
+        -CpuLimit $CpuLimit `
+        -MemoryRequest $MemoryRequest `
+        -MemoryLimit $MemoryLimit `
+        -AppEnvironment $appEnv | Out-Null
 
     Write-Host 'Deploying the API under test...' -ForegroundColor Cyan
     Invoke-Kubectl -Arguments @('apply', '-k', $overlayDirectory) | Out-Null
@@ -775,7 +872,8 @@ New-K6JobManifest `
     -GeneratorImage $K6Image `
     -PullPolicy $ImagePullPolicy `
     -CpuRequest $K6CpuRequest `
-    -ScenarioEnv $testEnv | Out-Null
+    -ScenarioEnv $testEnv `
+    -PrometheusWriteUrl $PrometheusWriteUrl | Out-Null
 
 Write-Host "Running the $TestType test against $TargetUrl ..." -ForegroundColor Cyan
 Write-Host "  Job manifest: $jobManifestPath"
