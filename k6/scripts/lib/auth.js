@@ -60,6 +60,7 @@
  */
 
 import http from "k6/http";
+import encoding from "k6/encoding";
 
 /*
  * A token, as cached for one VU. `expiresAt` is when the kit should stop using it,
@@ -84,13 +85,48 @@ function envNumber(name, fallback) {
   return isFinite(parsed) ? parsed : fallback;
 }
 
-/* True when a token endpoint is configured, i.e. when this module has work to do. */
+/*
+ * Which mechanism to use.
+ *
+ *   oauth2      (default) a standard OAuth2/OIDC token endpoint: a form-encoded POST,
+ *               client_credentials or password grant.
+ *   json-login  a bespoke login endpoint that takes a JSON body and answers with a token
+ *               somewhere in the response. Plenty of first-party identity APIs work this
+ *               way and are not OAuth2 at all, so the form-encoded flow cannot talk to
+ *               them: the content type is wrong, the grant types do not exist, and the
+ *               token arrives in a body field rather than as `access_token`.
+ *   off         authentication disabled, whatever else is configured. This is how a
+ *               caller that authenticates by other means stops this module repeating
+ *               the login - the journey scenario logs in once in setup() and passes
+ *               AUTH_MODE=off for exactly that reason.
+ */
+function authMode() {
+  return envValue("AUTH_MODE", "oauth2").toLowerCase();
+}
+
+/* The JSON-login endpoint. LOGIN_URL first, so one .env serves the journey and these. */
+function jsonLoginUrl() {
+  return envValue("LOGIN_URL", "") || envValue("AUTH_LOGIN_URL", "");
+}
+
+/* True when this module has work to do. */
 export function isAuthConfigured() {
+  const mode = authMode();
+
+  if (mode === "off" || mode === "none" || mode === "disabled") {
+    return false;
+  }
+  if (mode === "json-login") {
+    return jsonLoginUrl() !== "";
+  }
   return envValue("AUTH_TOKEN_URL", "") !== "";
 }
 
 function readAuthConfiguration() {
+  const mode = authMode();
+
   const configuration = {
+    mode: mode,
     tokenUrl: envValue("AUTH_TOKEN_URL", ""),
     clientId: envValue("AUTH_CLIENT_ID", ""),
     clientSecret: envValue("AUTH_CLIENT_SECRET", ""),
@@ -102,44 +138,88 @@ function readAuthConfiguration() {
     tokenHeader: envValue("AUTH_TOKEN_HEADER", "Authorization"),
     tokenPrefix: envValue("AUTH_TOKEN_PREFIX", "Bearer "),
     expirySkewSeconds: envNumber("AUTH_EXPIRY_SKEW", 30),
+
+    // json-login only.
+    loginUrl: jsonLoginUrl(),
+    // A JSON template in which {{username}} and {{password}} are substituted, so an
+    // endpoint that wants different field names - or extra fields like RememberMe - can
+    // be driven without a code change. Left empty, the default body in
+    // requestJsonLoginToken() is used.
+    loginBody: envValue("AUTH_LOGIN_BODY", ""),
+    // Where the token sits in the response, dot-separated. The default matches the
+    // shape {"data":{"accessToken":"..."}}.
+    tokenPath: envValue("AUTH_TOKEN_PATH", "data.accessToken"),
+    // Used only when the token is opaque and carries no expiry of its own. A JWT does,
+    // and its own exp is always preferred.
+    fallbackLifetimeSeconds: envNumber("AUTH_EXPIRES_IN", 300),
   };
 
-  // Fail before the run rather than 40 seconds into it, and say which variable is
-  // missing. A half-configured token endpoint produces a 400 from the IdP whose
-  // message usually does not name the absent parameter.
-  const problems = [];
-  if (configuration.tokenUrl === "") {
-    problems.push("AUTH_TOKEN_URL");
+  // The journey names these JOURNEY_*, and falling back to them means one .env file
+  // serves the journey AND every other test type, with the account stored once.
+  if (configuration.username === "") {
+    configuration.username = envValue("JOURNEY_USERNAME", "");
   }
-  if (configuration.grantType === "password") {
+  if (configuration.password === "") {
+    configuration.password = envValue("JOURNEY_PASSWORD", "");
+  }
+
+  // Fail before the run rather than 40 seconds into it, and name what is missing. A
+  // half-configured login produces a 400 from the identity provider whose message
+  // usually does not mention the absent parameter.
+  const problems = [];
+
+  if (mode === "json-login") {
+    if (configuration.loginUrl === "") {
+      problems.push("LOGIN_URL (or AUTH_LOGIN_URL)");
+    }
     if (configuration.username === "") {
-      problems.push("AUTH_USERNAME (required by AUTH_GRANT_TYPE=password)");
+      problems.push("AUTH_USERNAME (or JOURNEY_USERNAME)");
     }
     if (configuration.password === "") {
-      problems.push("AUTH_PASSWORD (required by AUTH_GRANT_TYPE=password)");
+      problems.push("AUTH_PASSWORD (or JOURNEY_PASSWORD)");
     }
   }
-  else if (configuration.grantType !== "client_credentials") {
-    problems.push(
-      'AUTH_GRANT_TYPE must be "client_credentials" or "password", but got "' +
-        configuration.grantType +
-        '"'
-    );
+  else if (mode === "oauth2") {
+    if (configuration.tokenUrl === "") {
+      problems.push("AUTH_TOKEN_URL");
+    }
+    if (configuration.grantType === "password") {
+      if (configuration.username === "") {
+        problems.push("AUTH_USERNAME (required by AUTH_GRANT_TYPE=password)");
+      }
+      if (configuration.password === "") {
+        problems.push("AUTH_PASSWORD (required by AUTH_GRANT_TYPE=password)");
+      }
+    }
+    else if (configuration.grantType !== "client_credentials") {
+      problems.push(
+        'AUTH_GRANT_TYPE must be "client_credentials" or "password", but got "' +
+          configuration.grantType +
+          '"'
+      );
+    }
+  }
+  else {
+    problems.push('AUTH_MODE must be "oauth2", "json-login" or "off", but got "' + mode + '"');
   }
 
   if (problems.length > 0) {
     throw new Error(
       "Authentication is misconfigured. Missing or invalid: " +
         problems.join(", ") +
-        ".\nSet them as environment variables on the run, for example:\n" +
+        ".\nSet them as environment variables on the run. For a standard OAuth2 endpoint:\n" +
         "  -EnvVars AUTH_TOKEN_URL=https://idp.example.com/connect/token," +
-        "AUTH_CLIENT_ID=my-client,AUTH_CLIENT_SECRET=***"
+        "AUTH_CLIENT_ID=my-client,AUTH_CLIENT_SECRET=***\n" +
+        "For a bespoke JSON login endpoint:\n" +
+        "  -EnvVars AUTH_MODE=json-login,LOGIN_URL=https://idp.example.com/accounts/login," +
+        "JOURNEY_USERNAME=someone@example.com,JOURNEY_PASSWORD=***"
     );
   }
 
-  // The secret legitimately may be empty when the IdP authenticates the client by
-  // mTLS or network position, but that is rare enough to be worth a nudge.
-  if (configuration.grantType === "client_credentials" && configuration.clientSecret === "") {
+  // The secret legitimately may be empty when the IdP authenticates the client by mTLS
+  // or network position, but that is rare enough to be worth a nudge.
+  if (mode === "oauth2" && configuration.grantType === "client_credentials" &&
+      configuration.clientSecret === "") {
     console.warn(
       "[auth] AUTH_CLIENT_SECRET is empty. That is correct only for a public client " +
         "or one authenticated by mTLS; otherwise the token endpoint will reject the request."
@@ -161,6 +241,139 @@ function formEncode(pairs) {
 }
 
 function requestToken(configuration) {
+  if (configuration.mode === "json-login") {
+    return requestJsonLoginToken(configuration);
+  }
+  return requestOAuth2Token(configuration);
+}
+
+/* Read a dot-separated path out of a parsed response body. */
+function readJsonPath(value, path) {
+  let current = value;
+
+  const parts = String(path).split(".");
+  for (let index = 0; index < parts.length; index += 1) {
+    if (current === null || current === undefined || typeof current !== "object") {
+      return null;
+    }
+    current = current[parts[index]];
+  }
+
+  return typeof current === "string" && current !== "" ? current : null;
+}
+
+/*
+ * How long this token is good for.
+ *
+ * A JWT states its own expiry and that is always preferred: inventing a lifetime and
+ * renewing against the guess either wastes logins or - worse - keeps using an expired
+ * token because the guess was too generous. If there is no readable exp, the configured
+ * fallback applies.
+ */
+function tokenLifetimeSeconds(accessToken, configuration) {
+  try {
+    const segments = String(accessToken).split(".");
+    if (segments.length === 3) {
+      const payload = JSON.parse(encoding.b64decode(segments[1], "rawurl", "s"));
+      if (payload && typeof payload.exp === "number") {
+        const secondsRemaining = Math.round(payload.exp - Date.now() / 1000);
+        if (secondsRemaining > 0) {
+          return secondsRemaining;
+        }
+      }
+    }
+  }
+  catch (ignored) {
+    // Opaque token, or a JWT this runtime cannot decode: use the configured lifetime.
+  }
+
+  return configuration.fallbackLifetimeSeconds;
+}
+
+/* JSON-escape a value for substitution into a body template, without its quotes. */
+function jsonStringBody(value) {
+  const encoded = JSON.stringify(String(value));
+  return encoded.slice(1, encoded.length - 1);
+}
+
+/*
+ * Log in against a bespoke JSON endpoint.
+ *
+ * This is the reason the mode exists: a first-party identity API usually takes
+ * application/json, has no grant types, and answers with the token nested somewhere like
+ * {"data":{"accessToken":"..."}}. Sending it a form-encoded body - which is what the
+ * OAuth2 path does - gets a 415 or a 400 that names nothing useful.
+ */
+function requestJsonLoginToken(configuration) {
+  const body = configuration.loginBody === ""
+    ? JSON.stringify({
+        Email: configuration.username,
+        Password: configuration.password,
+        RememberMe: true,
+      })
+    : configuration.loginBody
+        .replace(/\{\{username\}\}/g, jsonStringBody(configuration.username))
+        .replace(/\{\{password\}\}/g, jsonStringBody(configuration.password));
+
+  const response = http.post(configuration.loginUrl, body, {
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    // Same reason as the OAuth2 path: discardResponseBodies would empty this response
+    // and leave the token unreadable, while the POST itself still looked healthy.
+    responseType: "text",
+    tags: { name: "auth/login" },
+  });
+
+  if (response.status < 200 || response.status >= 300) {
+    let detail = "";
+    try {
+      detail = String(response.body).slice(0, 300);
+    }
+    catch (ignored) {
+      detail = "(body unavailable)";
+    }
+
+    throw new Error(
+      "Login failed: HTTP " +
+        response.status +
+        " from " +
+        configuration.loginUrl +
+        ".\nResponse: " +
+        detail +
+        "\nCheck AUTH_USERNAME/AUTH_PASSWORD (or JOURNEY_USERNAME/JOURNEY_PASSWORD), and the login URL."
+    );
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(response.body);
+  }
+  catch (error) {
+    const raw = response.body === undefined || response.body === null ? "" : String(response.body);
+    throw new Error(
+      "Login returned HTTP " +
+        response.status +
+        " but the body could not be parsed as JSON" +
+        (raw === ""
+          ? ". The body is EMPTY - the response was discarded (check discardResponseBodies and responseType)."
+          : ". Got: " + raw.slice(0, 200))
+    );
+  }
+
+  const accessToken = readJsonPath(payload, configuration.tokenPath);
+  if (!accessToken) {
+    throw new Error(
+      "Login response has no token at '" +
+        configuration.tokenPath +
+        "'. Top-level keys: " +
+        (payload ? Object.keys(payload).join(", ") : "(no object)") +
+        ". Set AUTH_TOKEN_PATH if the token lives elsewhere in the response."
+    );
+  }
+
+  return finishToken(configuration, accessToken, "", tokenLifetimeSeconds(accessToken, configuration));
+}
+
+function requestOAuth2Token(configuration) {
   const pairs = [["grant_type", configuration.grantType]];
 
   if (configuration.grantType === "password") {
@@ -240,22 +453,30 @@ function requestToken(configuration) {
     );
   }
 
-  // expires_in is seconds and optional in the specification. Defaulting to an hour
-  // and then refreshing against that assumption is worse than refreshing often, so
-  // when it is absent the kit renews every 5 minutes instead.
+  // expires_in is seconds and optional in the specification. Defaulting to an hour and
+  // then refreshing against that assumption is worse than refreshing often, so when it
+  // is absent the kit renews every 5 minutes instead.
   let lifetimeSeconds = Number(payload.expires_in);
   if (!isFinite(lifetimeSeconds) || lifetimeSeconds <= 0) {
     lifetimeSeconds = 300;
   }
 
-  // Never let the safety margin exceed the lifetime, or the token is considered
-  // expired the moment it is issued and every iteration fetches a new one.
+  return finishToken(configuration, payload.access_token, payload.token_type || "", lifetimeSeconds);
+}
+
+/*
+ * Assemble the cached token and log it. Shared by both mechanisms so the renewal
+ * arithmetic cannot drift between them.
+ */
+function finishToken(configuration, accessToken, tokenType, lifetimeSeconds) {
+  // Never let the safety margin exceed the lifetime, or the token is considered expired
+  // the moment it is issued and every iteration fetches a new one.
   const skew = Math.min(configuration.expirySkewSeconds, Math.floor(lifetimeSeconds / 2));
 
   const token = {
-    value: payload.access_token,
+    value: accessToken,
     expiresAt: Date.now() + (lifetimeSeconds - skew) * 1000,
-    tokenType: payload.token_type || "",
+    tokenType: tokenType,
     lifetimeSeconds: lifetimeSeconds,
   };
 

@@ -238,6 +238,152 @@ function ConvertTo-PerfTestEnvTable {
     return $table
 }
 
+function Protect-PerfTestSecretValues {
+    <#
+    Mask credential-looking values before they are written into an artefact.
+
+    Every runner records the run's environment variables in meta.json, because "which
+    knobs produced this number" is part of the result. That is right for
+    TARGET_VUS=50 and wrong for JOURNEY_PASSWORD: the value ends up in
+    results/<run>/meta.json, sitting in a directory full of files people share, attach
+    to tickets and paste into chat. The same applies to AUTH_CLIENT_SECRET and any
+    bearer token passed through REQUEST_HEADERS.
+
+    Names are matched case-insensitively against the usual suspects, so this works for
+    credentials the kit has never heard of, without anyone having to remember to
+    declare them. The KEY is kept and only the value is replaced, so meta.json still
+    records that a password was supplied - which is what makes a run reproducible -
+    without recording which one.
+
+    Returns a NEW hashtable; the caller's table is left alone so the real values can
+    still be handed to the container.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][hashtable] $Environment
+    )
+
+    if ($null -eq $Environment) {
+        return @{}
+    }
+
+    # PASSWORD covers JOURNEY_PASSWORD, DB_PASSWORD, SA_PASSWORD...; SECRET covers
+    # AUTH_CLIENT_SECRET and X-Auth-Secret; TOKEN covers bearer tokens and
+    # VAULT_TOKEN_ID; APIKEY/API_KEY and CREDENTIAL cover the rest.
+    $secretNamePattern = '(?i)(password|passwd|pwd|secret|token|apikey|api_key|credential|authorization|connectionstring|connection_string)'
+
+    # The name is not always the giveaway. REQUEST_HEADERS is a perfectly innocent name
+    # whose VALUE is routinely `Authorization: Bearer ...`, and an env var carrying a
+    # JSON login body has the password nested inside it:
+    #
+    #   {"Email":"a@b.c","Password":"nested-secret"}
+    #
+    # hence the optional quotes around the separator. A value that looks like it carries
+    # a credential is redacted even when its name looks harmless.
+    $secretValuePattern = '(?i)(bearer\s+\S|basic\s+\S|(password|passwd|secret|token|apikey|api_key|authorization|credential|connectionstring)["'']?\s*[:=]\s*["'']?\S)'
+
+    $masked = @{}
+    foreach ($name in $Environment.Keys) {
+        $value = $Environment[$name]
+
+        if ("$name" -match $secretNamePattern -or "$value" -match $secretValuePattern) {
+            $masked[$name] = '***REDACTED***'
+        }
+        else {
+            $masked[$name] = $value
+        }
+    }
+
+    return $masked
+}
+
+function Import-PerfTestEnvFile {
+    <#
+    Load a .env file and find one to load, returning both the values and the path used.
+
+    Why this exists: a journey run needs a login URL, an account and a password, and
+    typing those on every invocation is both tedious and a good way to leak the password
+    into shell history. A .env file keeps them in one ignored place, and -EnvVars still
+    overrides it when a single run needs different values.
+
+    Search order, first hit wins:
+      1. -ExplicitPath, when given. A path that does not exist is an ERROR rather than a
+         silent fallback, because "I pointed at my file and it used the other one" is
+         exactly the confusing outcome this is meant to remove.
+      2. Each path in -SearchPaths, in order.
+
+    Format: shell-style KEY=value, one per line.
+      * blank lines and lines starting with # are ignored
+      * a leading `export ` is accepted, so a file written for a shell still works
+      * surrounding single or double quotes are stripped
+      * an inline ` # comment` is NOT stripped - a password may legitimately contain
+         " # ", and silently truncating one would produce a login failure that looks
+         like bad credentials
+      * an unrecognised line is an ERROR with its line number. Skipping it silently is
+         how a typo becomes a mystery: the value simply never arrives, and the run fails
+         somewhere else entirely.
+
+    Returns an object with Path (the file used, or $null) and Values (a hashtable).
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ExplicitPath,
+        [string[]] $SearchPaths = @()
+    )
+
+    $candidates = @()
+    if ($ExplicitPath) {
+        if (-not (Test-Path -Path $ExplicitPath -PathType Leaf)) {
+            throw "The environment file '$ExplicitPath' does not exist. Pass a real path, or omit -EnvFile to use the default search."
+        }
+        $candidates = @($ExplicitPath)
+    }
+    else {
+        $candidates = @($SearchPaths | Where-Object { $_ -and (Test-Path -Path $_ -PathType Leaf) })
+    }
+
+    if ($candidates.Count -eq 0) {
+        return [pscustomobject]@{ Path = $null; Values = @{} }
+    }
+
+    $path = (Resolve-Path -Path $candidates[0]).Path
+    $values = @{}
+    $lineNumber = 0
+
+    foreach ($line in (Get-Content -Path $path)) {
+        $lineNumber++
+        $entry = "$line".Trim()
+
+        if ($entry -eq '' -or $entry.StartsWith('#')) {
+            continue
+        }
+
+        if ($entry -match '^export\s+') {
+            $entry = $entry.Substring(7).Trim()
+        }
+
+        if ($entry -notmatch '^(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<value>.*)$') {
+            throw ("$path line ${lineNumber}: expected KEY=value, but found: $entry")
+        }
+
+        $name = $Matches['name']
+        $value = $Matches['value'].Trim()
+
+        # Strip one layer of matching quotes.
+        if ($value.Length -ge 2) {
+            $first = $value.Substring(0, 1)
+            $last = $value.Substring($value.Length - 1, 1)
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+
+        $values[$name] = $value
+    }
+
+    return [pscustomobject]@{ Path = $path; Values = $values }
+}
+
 function Get-PerfTestSummaryWindow {
     <#
     Read the run's started_at / ended_at out of a summary.json WITHOUT letting
@@ -357,6 +503,8 @@ Export-ModuleMember -Function @(
     'Get-K6SummaryFromFile',
     'Write-PerfTestMetadata',
     'ConvertTo-PerfTestEnvTable',
+    'Protect-PerfTestSecretValues',
+    'Import-PerfTestEnvFile',
     'Get-PerfTestSummaryWindow',
     'Get-PerfTestGitRevision',
     'Invoke-Kubectl'

@@ -61,6 +61,11 @@ param(
     [string[]] $EnvVars = @(),
     [string] $ResultsRoot,
 
+    # Path to a .env file of KEY=value lines. Omit it and the runner looks for k6\.env
+    # and then <repo>\.env. Values from -EnvVars win over the file, so one run can
+    # override a single knob without editing the file.
+    [string] $EnvFile,
+
     # Escape hatch for the rare case where the target genuinely is inside the k6
     # container, or you are running with host networking.
     [switch] $AllowLocalhostTarget,
@@ -196,7 +201,44 @@ if ($loopbackReason) {
     Write-Warning $message
 }
 
-$testEnv = ConvertTo-PerfTestEnvTable -EnvVars $EnvVars
+# ---------------------------------------------------------------------------
+# Configuration: a .env file first, then -EnvVars on top.
+#
+# The file is the convenient place for values that rarely change and must not be typed
+# repeatedly - a login URL, an account, a password, an IdP client secret. -EnvVars wins
+# so a single run can override one knob without editing the file, and so the documented
+# examples keep working unchanged.
+# ---------------------------------------------------------------------------
+$envFileResult = Import-PerfTestEnvFile -ExplicitPath $EnvFile -SearchPaths @(
+    (Join-Path $PSScriptRoot '.env')
+    (Join-Path $repoRoot '.env')
+)
+$fileEnv = $envFileResult.Values
+$commandLineEnv = ConvertTo-PerfTestEnvTable -EnvVars $EnvVars
+
+if ($envFileResult.Path) {
+    Write-Host "Environment file : $($envFileResult.Path)" -ForegroundColor Cyan
+}
+else {
+    Write-Host "Environment file : none found (looked for k6\.env and .env). -EnvVars still applies." -ForegroundColor DarkGray
+}
+
+if ($fileEnv.ContainsKey('TARGET_URL')) {
+    # Only worth saying when the two actually disagree. run-journey.ps1 resolves its
+    # target FROM this file and then passes the same value as -TargetUrl, so warning
+    # there would be noise about a value that is in fact being used.
+    $fileTarget = "$($fileEnv['TARGET_URL'])"
+    if ($fileTarget -ne $TargetUrl) {
+        Write-Warning ("The environment file sets TARGET_URL='$fileTarget', which is ignored: the " +
+            "target comes from -TargetUrl ('$TargetUrl') so that it is validated and recorded precisely " +
+            'once. Remove it from the file, or pass the same value to -TargetUrl.')
+    }
+    $fileEnv.Remove('TARGET_URL')
+}
+
+$testEnv = @{}
+foreach ($name in $fileEnv.Keys) { $testEnv[$name] = $fileEnv[$name] }
+foreach ($name in $commandLineEnv.Keys) { $testEnv[$name] = $commandLineEnv[$name] }
 
 # docker compose v2 (plugin) vs the standalone v1 binary.
 $composeExecutable = 'docker'
@@ -417,7 +459,11 @@ Write-PerfTestMetadata -Path $metaPath -Data @{
     testid            = $testId
     target_url        = $TargetUrl
     scenario          = $scenarioFile
-    env_vars          = $testEnv
+    # Masked on purpose. meta.json is an artefact people attach to tickets and paste
+    # into chat, so a JOURNEY_PASSWORD or AUTH_CLIENT_SECRET must not be in it. The KEY
+    # is kept, because "a password was supplied" is part of reproducing a run; only the
+    # value is replaced.
+    env_vars          = (Protect-PerfTestSecretValues -Environment $testEnv)
     git_revision      = $revision
     k6_exit_code      = $exitCode
     thresholds_all_ok = $summary.thresholds_all_ok

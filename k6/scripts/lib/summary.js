@@ -245,6 +245,60 @@ function printStats(lines, label, values, stats) {
   });
 }
 
+/*
+ * Per-step latency for a multi-step journey.
+ *
+ * A journey tags each request with `name`, which k6 keeps as a separate
+ * http_req_duration{name:...} sub-metric. Without printing those here, the console
+ * shows one blended average for the whole flow - and "which step got slower" is the
+ * only question a journey exists to answer. The JSON always had this; the human
+ * summary did not.
+ *
+ * Only `name:` tags are listed. k6 also emits http_req_duration{expected_response:...},
+ * which is a correctness split rather than a step, and listing it here would just be
+ * noise on every single-endpoint run.
+ */
+function printTaggedSteps(lines, metrics) {
+  const pattern = /^http_req_duration\{name:(.+)\}$/;
+  const steps = [];
+
+  Object.keys(metrics).forEach(function (name) {
+    const match = pattern.exec(name);
+    if (match && metrics[name]) {
+      steps.push({ name: match[1], values: metrics[name] });
+    }
+  });
+
+  if (steps.length === 0) {
+    return;
+  }
+
+  // Slowest first, so the step that needs attention is not hunted for.
+  steps.sort(function (left, right) {
+    const leftP95 = firstDefined(left.values["p(95)"], left.values.avg, 0);
+    const rightP95 = firstDefined(right.values["p(95)"], right.values.avg, 0);
+    return rightP95 - leftP95;
+  });
+
+  lines.push("");
+  lines.push("  per step (ms, slowest first):");
+  steps.forEach(function (step) {
+    const padded = step.name.length < 22 ? step.name + " ".repeat(22 - step.name.length) : step.name;
+    lines.push(
+      "    " +
+        padded +
+        " avg " +
+        formatNumber(step.values.avg, 0) +
+        "   p95 " +
+        formatNumber(step.values["p(95)"], 0) +
+        "   p99 " +
+        formatNumber(step.values["p(99)"], 0) +
+        "   max " +
+        formatNumber(step.values.max, 0)
+    );
+  });
+}
+
 export function renderText(summary) {
   const metrics = summary.metrics || {};
   const duration = metrics.http_req_duration;
@@ -311,6 +365,7 @@ export function renderText(summary) {
   lines.push("");
   printStats(lines, "http_req_duration", duration, ["avg", "med", "p(90)", "p(95)", "p(99)", "max"]);
   printStats(lines, "http_req_waiting ", waiting, ["avg", "p(95)", "p(99)"]);
+  printTaggedSteps(lines, metrics);
 
   const thresholdNames = Object.keys(summary.thresholds || {});
   if (thresholdNames.length > 0) {

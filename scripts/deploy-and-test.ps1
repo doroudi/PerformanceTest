@@ -742,7 +742,15 @@ if (-not $DeployOnly) {
         image_pull_policy   = $ImagePullPolicy
         replicas            = $Replicas
         runtime_environment = $RuntimeEnvironment
-        env_vars            = $testEnv
+        # Masked on purpose, for the same reason as the compose runner: an artefact
+        # containing a credential gets shared far more widely than it should.
+        #
+        # NOTE the archived Job manifest (results/<run>/k6-job.yaml) still contains
+        # -EnvVars values verbatim, because it is the exact file that was applied and the
+        # Job needs the real values to run. That is precisely why credentials for a
+        # cluster run belong in a Kubernetes Secret referenced with envFrom/secretKeyRef,
+        # not in -EnvVars.
+        env_vars            = (Protect-PerfTestSecretValues -Environment $testEnv)
         job_name            = $jobName
         git_revision        = $revision
         started_at          = (Get-Date).ToUniversalTime().ToString('o')

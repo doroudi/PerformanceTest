@@ -16,4 +16,13 @@ k8s/.generated/
 # that file contains a live Vault token. An untracked-but-not-ignored .build/ is one
 # `git add -A` away from committing a credential.
 .build/
+
+# Local credentials for the runners.
+#
+# k6/.env holds the account password, the login URL and any IdP client secret that
+# run-test.ps1, run-journey.ps1 and deploy-and-test.ps1 read. k6/.env.example is the
+# committed template; the real file never is.
+.env
+*.env
+!.env.example
 results/

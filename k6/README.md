@@ -12,6 +12,9 @@ file only covers what lives in this directory.
 | `scripts/stress-test.js` | stepped plateaus to and past failure: find the knee |
 | `scripts/spike-test.js` | baseline -> sharp spike -> baseline: absorb and recover |
 | `scripts/soak-test.js` | hours at 60-80% of peak: leaks, pools, drift |
+| `scripts/rate-test.js` | a FIXED offered rate (open model): the only profile that can compare 1 pod vs 3 |
+| `scripts/journey-test.js` | a multi-step user flow: log in, then several endpoints, each measured separately |
+| `scripts/lib/auth.js` | token fetch/cache/refresh for authenticated targets |
 | `scripts/lib/env.js` | env parsing; `TARGET_URL` is required and has no default |
 | `scripts/lib/summary.js` | the machine-readable summary the runners parse |
 | `tests/summary.test.mjs` | `node k6/tests/summary.test.mjs` - checks the summary library |
@@ -21,6 +24,9 @@ file only covers what lives in this directory.
 | `grafana/provisioning/` | datasource + dashboard provider, mounted into Grafana |
 | `grafana/dashboards/` | **k6 load test** (the report) and **k6 ingestion check** (the diagnostic) |
 | `run-test.ps1` / `run-test.sh` | run a scenario against the compose stack |
+| `run-journey.ps1` | the multi-step journey: prompts for the password, always skips the preflight |
+| `run-auth-test.ps1` | any single-endpoint type against an authenticated target; refuses to run if auth is unconfigured |
+| `.env.example` | copy to `k6\.env` for the login URL, account and token settings |
 
 ## Quick start
 
@@ -179,44 +185,87 @@ To change modes, set `K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM` in
 
 ## Load testing an authenticated target
 
-Every scenario gets authentication without changing the scenario file: `buildRequestHeaders()`
-in `scripts/lib/env.js` merges a token from `scripts/lib/auth.js` into the request headers.
-Leave it unconfigured and nothing changes, so unauthenticated targets keep working as before.
+Every scenario gets authentication without changing the scenario file:
+`buildRequestHeaders()` in `scripts/lib/env.js` merges a token from `scripts/lib/auth.js`
+into the request headers, once per iteration. Leave all of it unconfigured and nothing
+changes, so unauthenticated targets keep working exactly as before.
 
-**Static token** - fine for a short run:
+Three ways, in ascending order of how much they buy you:
 
-```powershell
--EnvVars 'REQUEST_HEADERS=Authorization: Bearer eyJhbGciOi...'
-```
+| Mode | Configure | Renews? |
+|---|---|---|
+| Static header | `REQUEST_HEADERS=Authorization: Bearer eyJ...` | no |
+| OAuth2 | `AUTH_MODE=oauth2` + `AUTH_TOKEN_URL` + client credentials | yes |
+| Bespoke JSON login | `AUTH_MODE=json-login` + `LOGIN_URL` + account | yes |
 
-**Fetched and refreshed token** - OAuth2 client credentials, or password grant for a
-dedicated test user:
+**A static token expires mid-run**, and every request after that is a 401 - which reads as
+the service collapsing rather than the test having lost its credentials. Both fetching modes
+renew before expiry, which is what makes an authenticated **soak** possible.
 
-```powershell
--EnvVars 'AUTH_TOKEN_URL=https://idp.example.com/connect/token,AUTH_CLIENT_ID=my-client,AUTH_CLIENT_SECRET=***,AUTH_SCOPE=api'
+### `AUTH_MODE=json-login`, for first-party identity APIs
+
+Plenty of in-house identity APIs are not OAuth2 at all: they take `application/json`, have
+no grant types, and answer with the token nested somewhere in the body. The OAuth2 path
+cannot talk to them - wrong content type, wrong grant types, wrong response shape - so this
+mode does:
+
+```ini
+AUTH_MODE=json-login
+LOGIN_URL=https://idp.example.com/accounts/login
+JOURNEY_USERNAME=someone@example.com
+JOURNEY_PASSWORD=...
 ```
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AUTH_TOKEN_URL` | *(unset = auth off)* | token endpoint |
-| `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET` | | client credentials |
+| `AUTH_MODE` | `oauth2` | `oauth2`, `json-login`, or `off` |
+| `AUTH_TOKEN_URL` | | OAuth2 token endpoint |
+| `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET` | | OAuth2 client credentials |
 | `AUTH_GRANT_TYPE` | `client_credentials` | or `password` |
-| `AUTH_USERNAME` / `AUTH_PASSWORD` | | password grant only |
-| `AUTH_SCOPE` | | space separated |
-| `AUTH_AUDIENCE` | | sent as `audience` |
+| `AUTH_USERNAME` / `AUTH_PASSWORD` | fall back to `JOURNEY_*` | password grant, or json-login |
+| `AUTH_LOGIN_URL` | falls back to `LOGIN_URL` | json-login endpoint |
+| `AUTH_TOKEN_PATH` | `data.accessToken` | where the token sits in the JSON response |
+| `AUTH_LOGIN_BODY` | see below | JSON body template, with `{{username}}`/`{{password}}` substituted |
+| `AUTH_EXPIRES_IN` | `300` | lifetime for an **opaque** token; a JWT's own `exp` always wins |
+| `AUTH_SCOPE` / `AUTH_AUDIENCE` | | OAuth2 only |
 | `AUTH_TOKEN_HEADER` | `Authorization` | for APIs that use a custom header |
 | `AUTH_TOKEN_PREFIX` | `Bearer ` | set empty for a bare token |
 | `AUTH_EXPIRY_SKEW` | `30` | seconds of safety margin before real expiry |
 
-**Why the second mode exists.** A static token expires mid-run, and every request after
-that is a 401 - which reads as the service collapsing rather than the test having lost its
-credentials. The fetched-token mode renews before expiry, so a run of any length keeps
-working. That is what makes an authenticated **soak** possible.
+The default login body is `{"Email":"{{username}}","Password":"{{password}}","RememberMe":true}`.
+Set `AUTH_LOGIN_BODY` for an endpoint that wants different field names or extra fields. For a
+JWT the token's own `exp` is decoded and used, so renewal follows the real lifetime rather
+than a guess.
 
-`REQUEST_HEADERS` wins on a name collision, so an explicitly supplied header always beats
-an inferred one. Scenarios call `buildRequestHeaders()` per iteration precisely so a
-renewed token is picked up; it is cheap, because the static headers are parsed once at
-module load and the token comes from a cache.
+**`AUTH_MODE=off`** disables the mechanism whatever else is set. `run-journey.ps1` uses it:
+the journey logs in once in `setup()`, so leaving this on would add a redundant login per VU
+on top of that.
+
+### Credentials come from `k6/.env`
+
+Both runners read `k6/.env`, then `<repo>/.env`; `-EnvFile` names one explicitly. `-EnvVars`
+overrides the file, so one run can change a single knob without editing it. Copy
+`k6/.env.example` to start - and keep `k6/.env` gitignored, because it holds a password.
+Credential-shaped values are redacted from `meta.json`, so the file remains the only place a
+secret is written down.
+
+### The runner that refuses to run blind
+
+```powershell
+pwsh -File k6/run-auth-test.ps1 -TestType load `
+  -TargetUrl https://api.example.com/api/new-core/wallets -Vus 20 -Duration 2m
+```
+
+A protected endpoint answers **401 to every request**, which k6 records as a *fast* run at a
+100% failure rate with no error anywhere - the request succeeded, it just said no. So this
+wrapper checks that it can see how authentication is configured and **refuses to start**
+otherwise, then passes `-SkipPreflight`, which is mandatory for every authenticated type
+except `smoke`: the preflight sends an unauthenticated request and stops the run with exit
+code 2. It also warns when the only configured mechanism is a static header that cannot be
+renewed.
+
+`REQUEST_HEADERS` wins on a name collision, so an explicitly supplied header always beats an
+inferred one.
 
 ### Two things that will bite you
 
@@ -236,6 +285,95 @@ module load and the token comes from a cache.
 
 Never commit a token or a client secret. Pass them as environment variables locally, and
 in Kubernetes inject them into the k6 Job from a Secret rather than into the manifest.
+
+## A multi-step user journey
+
+`journey-test.js` measures a real flow rather than one endpoint: it logs in, then
+requests several URLs in sequence, and reports **each step separately**.
+
+```powershell
+# Recommended. Prompts for the password (never echoed, never in shell history), always
+# skips the preflight, and refuses a production-looking host by default.
+pwsh -File k6/run-journey.ps1 `
+  -TargetUrl https://api.example.com `
+  -LoginUrl  https://idp.example.com/accounts/login `
+  -Username  someone@example.com `
+  -Vus 5 -Duration 1m
+
+# Equivalent, if you would rather drive the generic runner directly.
+pwsh -File k6/run-test.ps1 -TestType journey `
+  -TargetUrl https://api.example.com -SkipPreflight `
+  -EnvVars 'LOGIN_URL=https://idp.example.com/accounts/login,JOURNEY_USERNAME=someone@example.com,JOURNEY_PASSWORD=***,TARGET_VUS=5,TEST_DURATION=1m'
+```
+
+**`-SkipPreflight` is required here, and that is not optional.** The preflight sends an
+unauthenticated smoke request to `-TargetUrl`; an API that needs a token answers 401, so
+the preflight concludes "not one request succeeded" and stops the run with exit code 2
+before the journey ever starts. The preflight is genuinely useful for an anonymous
+target and actively wrong for an authenticated one.
+
+`-TargetUrl` is the API base: `API_BASE_URL` falls back to it, so the host the runner
+validates, preflights and records in `meta.json` is the host the journey actually talks
+to. Set `API_BASE_URL` only when the API base and the recorded target must differ.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JOURNEY_USERNAME` / `JOURNEY_PASSWORD` | **required, no default** | the account the journey logs in as |
+| `LOGIN_URL` | **required, no default** | JSON login endpoint returning `data.accessToken` |
+| `API_BASE_URL` | falls back to `TARGET_URL` | base for the step URLs |
+| `KYC_STEP_PATH` / `WALLETS_PATH` / `REQUESTS_ACTIVE_PATH` | `/api/new-core/...` | the steps |
+| `STEP_PAUSE` | `0` | think time between steps |
+| `TARGET_VUS` / `TEST_DURATION` / `REQUEST_PAUSE` | `5` / `1m` / `0.5` | load profile |
+
+There are deliberately **no fallbacks for the login URL or the account**. A built-in
+login URL lets a run appear to work against an environment nobody chose, and a password
+written into a scenario file is a password in git.
+
+**Credentials are redacted from the artefacts.** `meta.json` records the run's environment
+so a result can be reproduced, but any variable whose *name* looks like a credential - or
+whose *value* does (`REQUEST_HEADERS=Authorization: Bearer ...`, a JSON login body) - is
+stored as `***REDACTED***`. The key is kept, so you can still see that a password was
+supplied; only the value is replaced. This applies to both runners. The one place a
+credential still appears verbatim is `results/<run>/k6-job.yaml` for a **cluster** run,
+because that file is the exact manifest that was applied - which is why cluster credentials
+belong in a Kubernetes Secret (`envFrom`/`secretKeyRef`) rather than in `-EnvVars`.
+
+### What load shape it applies
+
+One login in `setup()`, then every VU repeats the three steps for `TEST_DURATION` at a
+constant VU count. It is a **closed, VU-based model**, like `smoke` — not a ramp.
+
+- Offered load **falls** when the target slows down, because each VU waits for its own
+  response before sending the next request.
+- It therefore **cannot** answer "does one pod beat three" — that needs a fixed offered
+  rate, which is what `rate-test.js` is for.
+- Add `stages` to its `options` if you want a ramp; the per-step tags and thresholds keep
+  working unchanged.
+
+**Each step is tagged**, which is the whole point. The console summary and
+`summary.json` both break latency down per step, and each step has its own threshold,
+so a journey can fail because `/wallets` is slow while the other steps pass:
+
+```
+  per step (ms, slowest first):
+    login                  avg 591   p95 591   p99 591   max 591
+    kyc-step               avg 283   p95 391   p99 410   max 415
+    wallets                avg 275   p95 311   p99 318   max 320
+    requests-active        avg 249   p95 261   p99 262   max 262
+```
+
+Three things worth knowing:
+
+- **The login runs once, in `setup()`.** The load you generate is the steps you meant
+  to measure, not four VUs' worth of authentication. That is safe only because the
+  token outlives the run - the scenario decodes the JWT and logs its expiry at
+  start-up, and warns if it is under five minutes. For a run longer than the token's
+  life, move `login()` into the default function (it is exported for exactly that).
+- **`discardResponseBodies: true` would eat the token.** The login sets
+  `responseType: "text"` for that one request. Without it the POST returns 200 and
+  looks healthy while every iteration fails to parse an empty body.
+- **Credentials come from the environment, never from the file.** Locally pass them
+  with `-EnvVars`; in Kubernetes inject them from a Secret into the k6 Job.
 
 ## Running locally
 
