@@ -28,7 +28,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: api
-          image: your-aspnet-api:latest
+          image: your-api:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

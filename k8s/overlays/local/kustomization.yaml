@@ -18,5 +18,5 @@ images:
   # `name` must match the placeholder in k8s/base, so that the transformer
   # rewrites it rather than appending a second entry.
   - name: your-aspnet-api
-    newName: exchangeportal-finance-api
+    newName: service-api
     newTag: local

@@ -49,7 +49,7 @@
 
 .EXAMPLE
     ./scripts/deploy-and-test.ps1 -TargetUrl http://api-service:8080/api/orders `
-        -TestType load -Image exchangeportal-finance-api:$(git rev-parse --short HEAD) `
+        -TestType load -Image service-api:$(git rev-parse --short HEAD) `
         -EnvVars TARGET_VUS=200,HOLD_DURATION=15m -DeleteJobAfterRun
 #>
 [CmdletBinding()]
@@ -62,7 +62,7 @@ param(
     [Parameter(Position = 1)]
     [string] $TestType,
 
-    [string] $Image = 'exchangeportal-finance-api:local',
+    [string] $Image = 'service-api:local',
     [string] $K6Image = 'k6-custom:local',
 
     [string] $Namespace = 'perf-test',

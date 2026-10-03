@@ -60,7 +60,7 @@ pwsh -File k6/run-test.ps1 -TargetUrl http://host.docker.internal:5000/api/healt
 
 ### Getting local images into the cluster
 
-`-Image` defaults to `exchangeportal-finance-api:local`, built locally, which only
+`-Image` defaults to `sevice-api:local`, built locally, which only
 works if the cluster can see it. The runner handles this where it can:
 
 | Cluster | Behaviour |
