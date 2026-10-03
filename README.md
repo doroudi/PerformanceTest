@@ -3,22 +3,6 @@
 Load-test an API that runs as a container in Kubernetes, with k6 running as a Job
 inside the same cluster.
 
-## Is this a sensible design?
-
-Yes - running the generator inside the cluster is the standard pattern (it is what
-the official `grafana/k6-operator` does), and it exists for a good reason: you stop
-measuring your laptop, your home network and your VPN, and start measuring the
-system. But the pattern only pays off if three things are true, and the original
-version of this kit violated all three:
-
-1. **The generator must not be the bottleneck.** k6 needs real CPU, and it should
-   not share a node with the system under test. A CPU-throttled k6 reports the API
-   as slow when k6 is what ran out of CPU.
-2. **You must measure the configuration you ship.** A Debug build, a Development
-   environment, or a Swagger page tells you nothing about production.
-3. **Numbers must be kept and compared.** A single run answers nothing on its own;
-   "is this release slower than the last one?" needs a recorded baseline.
-
 ## Two paths, one set of scenarios
 
 | | `k6/run-test.ps1` | `scripts/deploy-and-test.ps1` |
