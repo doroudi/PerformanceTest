@@ -93,6 +93,218 @@ function Resolve-PerfTestScenario {
     return (Join-Path $ScenariosDirectory "$TestType-test.js")
 }
 
+function Resolve-PerfTestUsersFile {
+    <#
+    Find the credential pool file.
+
+    Precedence: an explicit path, then a JOURNEY_USERS_FILE entry from the environment file,
+    then k6\users.json next to k6\.env. Returns '' when there is none, because a pool is
+    optional - a run with a single account is still a valid run.
+
+    An explicit path that does not exist is an ERROR rather than a silent fallback: "I
+    pointed at my users file and it used another one / it used nothing" is the failure this
+    avoids, and with credentials the silent version means measuring one account while
+    believing you measured thirty.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ExplicitPath,
+        [string[]] $SearchPaths = @(),
+        [hashtable] $Environment = @{}
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        if (-not (Test-Path $ExplicitPath -PathType Leaf)) {
+            throw "-UsersFile was not found: $ExplicitPath"
+        }
+        return (Resolve-Path $ExplicitPath).Path
+    }
+
+    foreach ($name in @('JOURNEY_USERS_FILE', 'USERS_FILE')) {
+        if ($Environment.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace("$($Environment[$name])")) {
+            $candidate = "$($Environment[$name])"
+            if (-not (Test-Path $candidate -PathType Leaf)) {
+                throw "The environment file sets $name=$candidate, but that file does not exist."
+            }
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    foreach ($candidate in $SearchPaths) {
+        if (Test-Path $candidate -PathType Leaf) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    return ''
+}
+
+function Read-PerfTestUsersFile {
+    <#
+    Read a credential pool and return its JSON text, ready to hand to k6 as
+    JOURNEY_USERS_JSON.
+
+    The text is passed through unchanged on purpose: the per-entry rules (which key names
+    mean the account and the password, duplicates, the "username:password" shorthand) live
+    in k6/scripts/lib/users.js, and are checked there by k6/tests/users.test.mjs. Checking
+    them again here would mean two definitions of a valid file, and the one that drifted
+    would be the one nobody tested.
+
+    What IS checked here is what can be checked without a cluster: the file exists, is JSON,
+    and contains at least one account. Those are the mistakes that would otherwise cost a
+    whole run - a typo'd path, a trailing comma, an empty array.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        throw "The credential pool file was not found: $Path"
+    }
+
+    $text = Get-Content -Path $Path -Raw
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "The credential pool file is empty: $Path"
+    }
+
+    $parsed = $null
+    try {
+        $parsed = $text | ConvertFrom-Json
+    }
+    catch {
+        throw ("The credential pool file is not valid JSON: $Path`n$($_.Exception.Message)`n" +
+            'It should look like: [{"username":"a@example.com","password":"..."}, ...]')
+    }
+
+    $entries = @()
+    if ($parsed -is [array]) { $entries = @($parsed) }
+    elseif ($parsed -and $parsed.users) { $entries = @($parsed.users) }
+
+    if ($entries.Count -eq 0) {
+        throw ("The credential pool file contains no accounts: $Path`n" +
+            'It must be a JSON array of accounts, or an object with a "users" array.')
+    }
+
+    return $text
+}
+
+function Get-PerfTestHostAddress {
+    <#
+    Resolve a hostname on THIS machine and return its first IPv4 address.
+
+    Why the runner resolves it instead of letting the cluster do it: inside a cluster,
+    names go through the cluster's DNS, and that resolver may not reach external names at
+    all. Measured on a real minikube here, a k6 pod asking for the identity provider got
+    `lookup tc-idp-api.nt-development.dev on 10.96.0.10:53: server misbehaving` while
+    CoreDNS logged `read udp 10.244.0.2:51398->192.168.65.254:53: i/o timeout`, and the
+    same name resolved perfectly from the host. Every authenticated scenario therefore
+    died before its first request, for a reason no part of the test controlled.
+
+    Resolving where DNS does work and pinning the address into the Job's /etc/hosts takes
+    the cluster's resolver out of the path. Returns $null when the name cannot be
+    resolved, so a caller can warn and carry on rather than failing a run over a lookup it
+    may not have needed.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $HostName)
+
+    try {
+        $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
+    }
+    catch {
+        return $null
+    }
+
+    foreach ($address in $addresses) {
+        if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            return $address.IPAddressToString
+        }
+    }
+
+    return $null
+}
+
+function Test-PerfTestTcpEndpoint {
+    <#
+    Can this machine open a TCP connection to host:port? Fast, and never throws.
+
+    Why it exists: a NodePort is opened on the NODE's network, not on the host's loopback.
+    On Docker Desktop's built-in Kubernetes a NodePort does answer on 127.0.0.1, which is
+    where the `http://127.0.0.1:30030` line in this kit came from - but on minikube (whose
+    nodes sit on 192.168.49.0/24, inside a VM) and on kind, that address refuses the
+    connection. Printing a URL anyway sends people to a dead link and makes a working
+    Grafana look broken, so the scripts ask this first and offer a route that works
+    instead of asserting one that may not.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ComputerName = '127.0.0.1',
+        [Parameter(Mandatory = $true)][int] $Port,
+        [int] $TimeoutMilliseconds = 800
+    )
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $connect = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        if (-not $connect.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
+            return $false
+        }
+        # EndConnect throws when the connection was refused, which is the answer we want.
+        $client.EndConnect($connect)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $client.Dispose()
+    }
+}
+
+function Get-PerfTestFreeLocalPort {
+    <#
+    The first candidate port that nothing on this machine answers on.
+
+    For a `kubectl port-forward`, where "free" means two things at once: the forward has to
+    be able to bind it, and whatever IS on it must not be mistaken for the thing being
+    forwarded. The second is the one that bites - the compose stack already publishes its
+    own Grafana on 127.0.0.1:3000, so forwarding in-cluster Grafana to 3000 either fails
+    with "address already in use" or, if it somehow binds, shows the COMPOSE dashboard,
+    which queries the compose Prometheus and reports "No data" for a cluster run. That
+    looks exactly like a broken in-cluster metrics pipeline.
+
+    Returns $null when every candidate is taken, so the caller can print the port as a
+    placeholder rather than pretending to know.
+    #>
+    [CmdletBinding()]
+    param([int[]] $Candidate = @(3000, 3001, 3002, 3003, 3004))
+
+    foreach ($port in $Candidate) {
+        if (-not (Test-PerfTestTcpEndpoint -Port $port)) {
+            return $port
+        }
+    }
+
+    return $null
+}
+
+function New-PerfTestId {
+    <#
+    The identifier for one run: <utc timestamp>-<type>, e.g. 20261005-070829-load.
+
+    One function, two consumers, deliberately: the results directory is named after it
+    AND the k6 Job is tagged with it, so a Grafana series and the artefact that explains
+    it name each other. Computing the same string in two places is how those drift
+    apart, and the symptom is a Grafana link that filters to nothing.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $TestType)
+
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $safeName = ($TestType -replace '[^A-Za-z0-9\-_]', '-')
+
+    return "$stamp-$safeName"
+}
+
 function New-PerfTestRunDirectory {
     <#
     Create results/<utc timestamp>-<name>/ for one run.
@@ -107,9 +319,7 @@ function New-PerfTestRunDirectory {
         [Parameter(Mandatory = $true)][string] $Name
     )
 
-    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
-    $safeName = ($Name -replace '[^A-Za-z0-9\-_]', '-')
-    $runDirectory = Join-Path $ResultsRoot "$stamp-$safeName"
+    $runDirectory = Join-Path $ResultsRoot (New-PerfTestId -TestType $Name)
 
     if (-not (Test-Path $runDirectory -PathType Container)) {
         New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
@@ -497,6 +707,10 @@ Export-ModuleMember -Function @(
     'Write-Utf8NoBom',
     'Get-PerfTestTypes',
     'Resolve-PerfTestScenario',
+    'New-PerfTestId',
+    'Get-PerfTestHostAddress',
+    'Test-PerfTestTcpEndpoint',
+    'Get-PerfTestFreeLocalPort',
     'New-PerfTestRunDirectory',
     'Get-K6SummaryJsonFromText',
     'Get-K6SummaryFromText',
@@ -505,6 +719,8 @@ Export-ModuleMember -Function @(
     'ConvertTo-PerfTestEnvTable',
     'Protect-PerfTestSecretValues',
     'Import-PerfTestEnvFile',
+    'Resolve-PerfTestUsersFile',
+    'Read-PerfTestUsersFile',
     'Get-PerfTestSummaryWindow',
     'Get-PerfTestGitRevision',
     'Invoke-Kubectl'

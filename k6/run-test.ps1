@@ -66,6 +66,18 @@ param(
     # override a single knob without editing the file.
     [string] $EnvFile,
 
+    # Path to a JSON file of test accounts, one per virtual user:
+    #
+    #   [{ "username": "a@example.com", "password": "..." }, ...]
+    #
+    # Omit it and the runner looks for k6\users.json. The pool is handed to k6 as
+    # JOURNEY_USERS_JSON, which every scenario understands; with it, each VU authenticates
+    # as its own account instead of the whole run sharing one.
+    #
+    # It is NOT passed through -EnvVars: that parser splits entries on commas, which would
+    # quietly take a JSON array apart at the first one.
+    [string] $UsersFile,
+
     # Escape hatch for the rare case where the target genuinely is inside the k6
     # container, or you are running with host networking.
     [switch] $AllowLocalhostTarget,
@@ -239,6 +251,29 @@ if ($fileEnv.ContainsKey('TARGET_URL')) {
 $testEnv = @{}
 foreach ($name in $fileEnv.Keys) { $testEnv[$name] = $fileEnv[$name] }
 foreach ($name in $commandLineEnv.Keys) { $testEnv[$name] = $commandLineEnv[$name] }
+
+# ---------------------------------------------------------------------------
+# A pool of test accounts, one per virtual user.
+#
+# Added to the environment AFTER the merge above, so it cannot be mangled by the
+# comma-splitting -EnvVars parser, and so a pool cannot be introduced through -EnvVars at
+# all (which is also the path that would write it into an archived Job manifest on the
+# cluster side).
+# ---------------------------------------------------------------------------
+$usersFilePath = Resolve-PerfTestUsersFile -ExplicitPath $UsersFile -Environment $fileEnv -SearchPaths @(
+    (Join-Path $PSScriptRoot 'users.json')
+)
+
+if ($usersFilePath) {
+    $usersJson = Read-PerfTestUsersFile -Path $usersFilePath
+    $testEnv['JOURNEY_USERS_JSON'] = $usersJson
+
+    $parsedUsers = $usersJson | ConvertFrom-Json
+    $accounts = if ($parsedUsers -is [array]) { @($parsedUsers) } elseif ($parsedUsers.users) { @($parsedUsers.users) } else { @() }
+
+    Write-Host "Accounts      : $($accounts.Count) from $usersFilePath" -ForegroundColor Cyan
+    Write-Host '                (each VU authenticates as one of them; tags carry user-01, user-02, ...)' -ForegroundColor DarkGray
+}
 
 # docker compose v2 (plugin) vs the standalone v1 binary.
 $composeExecutable = 'docker'

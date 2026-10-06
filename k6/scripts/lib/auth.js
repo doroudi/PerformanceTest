@@ -57,16 +57,42 @@
  * the number of VUs that ramp up simultaneously, raise AUTH_EXPIRY_SKEW so tokens
  * are reused longer, or move the fetch into `setup()` (which runs once) and pass the
  * token to the VUs - see the note at the bottom of this file.
+ *
+ * A POOL OF ACCOUNTS, INSTEAD OF ONE ACCOUNT USED BY EVERY VU
+ * ----------------------------------------------------------
+ * When JOURNEY_USERS_JSON is set (see lib/users.js), each VU authenticates as its own
+ * account. The account is chosen lazily, per VU, inside authHeaders() - never at module
+ * scope, which is the init context where __VU is 0 and every VU would take the first
+ * account in the pool.
+ *
+ * This changes what a run measures: thirty VUs on one account serialize on that account's
+ * rows, share its cache and share its quota, so a single-account run can show a knee that
+ * belongs to the test rather than to the system.
+ *
+ * `fetchTokenForSetup()` deliberately refuses to run with a pool: it fetches ONE token for
+ * the whole run, which with a pool would authenticate everyone as the same account while
+ * appearing to support many.
  */
 
 import http from "k6/http";
 import encoding from "k6/encoding";
+
+import { accountLabel, describeAssignment, loadUsers, userForVu, USERS_JSON_ENV } from "./users.js";
 
 /*
  * A token, as cached for one VU. `expiresAt` is when the kit should stop using it,
  * which is deliberately earlier than the real expiry by AUTH_EXPIRY_SKEW.
  */
 let cachedToken = null;
+
+/*
+ * The credential pool, parsed once. `null` when the run uses a single account.
+ *
+ * loadUsers() only reads __ENV (and, for a mounted file, open()) - it never uses __VU -
+ * which is what makes it safe at module scope. Selecting the ACCOUNT is what needs __VU,
+ * and that happens per call, below.
+ */
+const pool = loadUsers();
 
 function envValue(name, fallback) {
   const raw = __ENV[name];
@@ -163,6 +189,21 @@ function readAuthConfiguration() {
     configuration.password = envValue("JOURNEY_PASSWORD", "");
   }
 
+  // A pool replaces the single account, per VU. Resolved HERE and not at module scope:
+  // module scope is the init context, where __VU is 0, so every VU would authenticate as
+  // the first account in the pool - one account, many sessions, silently.
+  if (pool) {
+    const assignment = userForVu(pool.users, __VU);
+    configuration.username = assignment.user.username;
+    configuration.password = assignment.user.password;
+    configuration.account = accountLabel(assignment.index);
+    configuration.accountAssignment = describeAssignment(pool.users, __VU, assignment.index);
+  }
+  else {
+    configuration.account = "";
+    configuration.accountAssignment = "";
+  }
+
   // Fail before the run rather than 40 seconds into it, and name what is missing. A
   // half-configured login produces a 400 from the identity provider whose message
   // usually does not mention the absent parameter.
@@ -247,6 +288,17 @@ function requestToken(configuration) {
   return requestOAuth2Token(configuration);
 }
 
+/*
+ * Tags for a token request: the usual name, plus the account when the run has a pool, so
+ * "which account is slow at logging in" is answerable from the metrics rather than by
+ * reading the log.
+ */
+function tokenRequestTags(configuration) {
+  return configuration.account
+    ? { name: "auth/token", account: configuration.account }
+    : { name: "auth/token" };
+}
+
 /* Read a dot-separated path out of a parsed response body. */
 function readJsonPath(value, path) {
   let current = value;
@@ -320,7 +372,9 @@ function requestJsonLoginToken(configuration) {
     // Same reason as the OAuth2 path: discardResponseBodies would empty this response
     // and leave the token unreadable, while the POST itself still looked healthy.
     responseType: "text",
-    tags: { name: "auth/login" },
+    tags: configuration.account
+      ? { name: "auth/login", account: configuration.account }
+      : { name: "auth/login" },
   });
 
   if (response.status < 200 || response.status >= 300) {
@@ -403,7 +457,7 @@ function requestOAuth2Token(configuration) {
     // itself succeeded and looks perfectly healthy in the metrics. Setting
     // responseType overrides discardResponseBodies for this one request.
     responseType: "text",
-    tags: { name: "auth/token" },
+    tags: tokenRequestTags(configuration),
   });
 
   if (response.status < 200 || response.status >= 300) {
@@ -481,6 +535,10 @@ function finishToken(configuration, accessToken, tokenType, lifetimeSeconds) {
   };
 
   // Deliberately does NOT log the token itself - run logs get archived and shared.
+  //
+  // With a pool it DOES name the account, once per VU per renewal, plus the redirect
+  // wrapper here: the account name is what makes "VU 7 is the outlier" answerable, and an
+  // account name is not a credential. Use dedicated test accounts, not shared ones.
   console.log(
     "[auth] obtained a token (" +
       lifetimeSeconds +
@@ -488,8 +546,13 @@ function finishToken(configuration, accessToken, tokenType, lifetimeSeconds) {
       (lifetimeSeconds - skew) +
       "s, type " +
       (token.tokenType || "unspecified") +
-      ")"
+      ")" +
+      (configuration.account ? " for " + configuration.account + " / " + configuration.username : "")
   );
+
+  if (configuration.accountAssignment) {
+    console.log(configuration.accountAssignment);
+  }
 
   return token;
 }
@@ -564,6 +627,19 @@ export function authTokenSecondsRemaining() {
  * runs once for the whole test, which is the point.
  */
 export function fetchTokenForSetup() {
+  // Refused, rather than quietly doing the wrong thing: this returns ONE token for the
+  // whole run, so with a pool every VU would end up authenticated as the same account -
+  // which is the exact situation the pool exists to avoid, and it would look like it
+  // worked.
+  if (pool) {
+    throw new Error(
+      "fetchTokenForSetup() cannot be used with a credential pool (" + USERS_JSON_ENV + ", " +
+        pool.users.length + " accounts): it fetches a single token for the whole run, so every VU would " +
+        "authenticate as the same account. Call authHeaders() per iteration instead - each VU then " +
+        "fetches and renews its own token - or run without the pool."
+    );
+  }
+
   return currentToken().value;
 }
 

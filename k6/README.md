@@ -15,9 +15,15 @@ file only covers what lives in this directory.
 | `scripts/rate-test.js` | a FIXED offered rate (open model): the only profile that can compare 1 pod vs 3 |
 | `scripts/journey-test.js` | a multi-step user flow: log in, then several endpoints, each measured separately |
 | `scripts/lib/auth.js` | token fetch/cache/refresh for authenticated targets |
+| `scripts/lib/users.js` | a pool of accounts, one per virtual user (round robin, stable per VU) |
+| `scripts/lib/profiles.js` | the load shapes (steady, load, stress, spike) the journey can run under |
 | `scripts/lib/env.js` | env parsing; `TARGET_URL` is required and has no default |
 | `scripts/lib/summary.js` | the machine-readable summary the runners parse |
 | `tests/summary.test.mjs` | `node k6/tests/summary.test.mjs` - checks the summary library |
+| `tests/users.test.mjs` | `node k6/tests/users.test.mjs` - checks pool parsing and assignment |
+| `tests/profiles.test.mjs` | `node k6/tests/profiles.test.mjs` - checks the load shapes |
+| `tests/journey-pool.test.mjs` | `node k6/tests/journey-pool.test.mjs` - runs the journey with k6 stubbed, asserting each VU logs in as its own account |
+| `users.example.json` | copy to `users.json` (gitignored) for a pool of accounts |
 | `Dockerfile` | the generator image used by cluster runs, k6 tag pinned |
 | `docker-compose.yml` | k6 + Prometheus + Grafana + a demo target |
 | `prometheus-config.yml` | Prometheus config; the remote-write receiver is what matters |
@@ -27,6 +33,11 @@ file only covers what lives in this directory.
 | `run-journey.ps1` | the multi-step journey: prompts for the password, always skips the preflight |
 | `run-auth-test.ps1` | any single-endpoint type against an authenticated target; refuses to run if auth is unconfigured |
 | `.env.example` | copy to `k6\.env` for the login URL, account and token settings |
+
+The cluster equivalents live one directory up and are listed here only so the two paths
+are not confused: `../scripts/run-cluster-test.ps1` (interactive: build, deploy,
+preflight, run, Grafana link) and `../scripts/deploy-and-test.ps1` (the non-interactive
+runner both it and CI use).
 
 ## Quick start
 
@@ -44,6 +55,24 @@ pwsh -File k6/run-test.ps1 -TargetUrl http://host.docker.internal:5180/healthz -
 At the end of every run the runner prints a **Grafana link already zoomed to that
 run's window**. Use it - it is the difference between "Grafana is broken" and "I was
 looking at the wrong time range" (see below).
+
+### The same scenarios, in the cluster
+
+Everything in `scripts/` also runs as a Kubernetes Job, and the cluster path has its
+own front door:
+
+```powershell
+pwsh -File scripts/run-cluster-test.ps1 -TestType load -TargetPath /api/new-core/wallets -DryRun
+pwsh -File scripts/run-cluster-test.ps1 -TestType load -TargetPath /api/new-core/wallets
+```
+
+The scenarios are baked into the `k6` image from `k6/Dockerfile` (which copies
+`k6/scripts` to `/scripts`), so it is the *same files* on both paths - there is no
+second copy of a scenario to keep in step. What differs is where the generator runs,
+and that the API then sits under the CPU and memory limits you asked for, which is the
+only way a pod's capacity can be measured. `scripts/run-cluster-test.ps1` reads
+`k6\.env` for the login details, puts the credential-shaped values into a Kubernetes
+Secret, and prints the in-cluster Grafana link for the run.
 
 ### The demo target
 
@@ -286,6 +315,15 @@ inferred one.
 Never commit a token or a client secret. Pass them as environment variables locally, and
 in Kubernetes inject them into the k6 Job from a Secret rather than into the manifest.
 
+One more thing that only bites a **cluster** run: the identity provider's hostname may not
+be resolvable from inside the cluster at all (measured here: CoreDNS timing out against
+Docker Desktop's resolver for `tc-idp-api.nt-development.dev`, while the host resolved it
+fine). The login then fails with `lookup <host> on <ip>:53: server misbehaving` and every
+request is a 401 before one is even sent. Pass `-ResolveHost <host>` to
+`scripts/deploy-and-test.ps1` - it resolves the name on your machine and pins it into the
+Job's `/etc/hosts` - or let `scripts/run-cluster-test.ps1` do it, which pins the target and
+`LOGIN_URL` for you. See the main README, "Testing an endpoint that needs authorization".
+
 ## A multi-step user journey
 
 `journey-test.js` measures a real flow rather than one endpoint: it logs in, then
@@ -340,15 +378,63 @@ belong in a Kubernetes Secret (`envFrom`/`secretKeyRef`) rather than in `-EnvVar
 
 ### What load shape it applies
 
-One login in `setup()`, then every VU repeats the three steps for `TEST_DURATION` at a
-constant VU count. It is a **closed, VU-based model**, like `smoke` — not a ramp.
+`steady` by default: `setup()` logs in once, then every VU repeats the steps for
+`TEST_DURATION` at a constant VU count. It is a **closed, VU-based** model in every profile —
+not a ramp, and not a fixed rate.
 
-- Offered load **falls** when the target slows down, because each VU waits for its own
-  response before sending the next request.
-- It therefore **cannot** answer "does one pod beat three" — that needs a fixed offered
-  rate, which is what `rate-test.js` is for.
-- Add `stages` to its `options` if you want a ramp; the per-step tags and thresholds keep
-  working unchanged.
+```powershell
+pwsh -File k6/run-journey.ps1 -Profile stress -EnvVars STEP_VUS=10,STRESS_STEPS=4,STEP_DURATION=1m
+pwsh -File k6/run-journey.ps1 -Profile load   -Vus 30 -EnvVars RAMP_DURATION=1m,HOLD_DURATION=5m
+```
+
+| `JOURNEY_PROFILE` | shape | knobs |
+|---|---|---|
+| `steady` | constant | `TARGET_VUS`, `TEST_DURATION` |
+| `load` | ramp, hold, ramp down | `TARGET_VUS`, `RAMP_DURATION`, `HOLD_DURATION` |
+| `stress` | stepped plateaus, then 0 | `STEP_VUS`, `STRESS_STEPS`, `STEP_DURATION` |
+| `spike` | baseline, spike, recovery | `BASELINE_VUS`, `SPIKE_VUS`, `BASELINE_DURATION`, `SPIKE_DURATION` |
+| `rate` | a FIXED offered rate (open model) | `TARGET_RPS`, `TEST_DURATION`, `PREALLOCATED_VUS`, `MAX_VUS` |
+| `rate-ramp` | a FIXED offered rate rising in steps, then 0 | the above + `RATE_STEPS`, `STEP_DURATION` |
+
+The first four are **closed**: offered load **falls** when the target slows down, because each
+VU waits for its own response before sending the next request. So they cannot answer "does one
+pod beat three" (that needs a fixed offered rate), and they cannot push a server that is
+already struggling. `rate` and `rate-ramp` offer a fixed number of iterations per second
+whatever the target does, which is the shape to use to load a server - and the one where
+`dropped_iterations` matters, since a dropped iteration is load that was never offered.
+
+In `stress` and `spike` the per-step thresholds are *meant* to be crossed, so the failure gate
+is loosened and does not abort. In `steady` it aborts on the first failed requests, so a
+broken login costs seconds instead of the whole profile.
+
+### Adding a step
+
+One line in the `STEPS` table near the top of the file:
+
+```js
+{ name: "statements", path: envString("STATEMENTS_PATH", "/statements"), p95: 2500 },
+```
+
+The request, its per-step metric, its threshold and its console row are generated from that
+entry — nothing else to edit, and no step can be added without being named and measured.
+Paths are relative to the base URL you configure, so a base of `https://host/api/new-core`
+makes `/kyc/step` resolve to `…/api/new-core/kyc/step`, and each step's `<STEP>_PATH` variable
+can still override it on its own.
+
+### Running it as many users instead of one
+
+```powershell
+# k6/users.json (gitignored; k6/users.example.json is the template):
+#   [{"username":"a@example.com","password":"..."}, {"username":"b@example.com","password":"..."}]
+pwsh -File k6/run-journey.ps1 -Vus 30 -Duration 5m
+```
+
+With a pool, each VU authenticates as its own account - no `JOURNEY_USERNAME`, no password
+prompt - and each request is tagged `account=user-01`, `user-02`, ... so a slow outlier
+account is visible rather than averaged away. The pool is passed to k6 as
+`JOURNEY_USERS_JSON` and never through `-EnvVars` (which splits on commas and would take the
+JSON apart). `-UsersFile` names a file explicitly; otherwise `k6\users.json` is used when it
+exists, and `JOURNEY_USERS_FILE` in the `.env` file also works.
 
 **Each step is tagged**, which is the whole point. The console summary and
 `summary.json` both break latency down per step, and each step has its own threshold,

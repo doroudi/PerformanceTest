@@ -25,4 +25,14 @@ k8s/.generated/
 .env
 *.env
 !.env.example
+
+# A pool of test accounts, one per virtual user.
+#
+# k6/users.json holds a password per account, so it is exactly as sensitive as k6/.env and
+# is ignored for the same reason. It is read by k6/run-journey.ps1 and
+# scripts/run-cluster-test.ps1 (-UsersFile) and handed to the generator as
+# JOURNEY_USERS_JSON; k6/users.example.json is the committed template.
+k6/users.json
+*.users.json
+!*.users.example.json
 results/

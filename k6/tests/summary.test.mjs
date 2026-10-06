@@ -53,6 +53,11 @@ function sampleData(overrides = {}) {
       },
       vus_max: { type: "gauge", contains: "default", values: { value: 1, min: 1, max: 1 } },
       iterations: { type: "counter", contains: "default", values: { count: 1180, rate: 19.62 } },
+      iteration_duration: {
+        type: "trend",
+        contains: "time",
+        values: { avg: 62.4, min: 40.1, med: 60, max: 130.2, "p(90)": 80, "p(95)": 95, "p(99)": 120 },
+      },
       data_received: { type: "counter", contains: "data", values: { count: 812345, rate: 13539 } },
     },
     root_group: {
@@ -99,6 +104,13 @@ assert.ok(text.includes("http://api-service:8080/api/health"), "text summary nam
 assert.ok(text.includes("PASS  http_req_duration: p(95)<1000"), "text summary lists threshold results");
 assert.ok(text.includes("all passed"), "text summary reports passing thresholds");
 assert.ok(text.includes("0 of 1180 requests"), "error line states the failing count out of the total");
+// For a multi-step journey this is the flow time a user experiences. It is not
+// derivable from the per-request percentiles above, so it must be printed.
+assert.ok(
+  text.includes("iteration_duration"),
+  "text summary prints the end-to-end iteration time, not only per-request latency"
+);
+assert.ok(text.includes("62.40"), "iteration_duration stats come from the metric, not a placeholder");
 
 // 2. A crossed threshold must be visible and machine-detectable.
 const failing = buildSummary(
@@ -186,5 +198,25 @@ assert.equal(transported.schema, SUMMARY_SCHEMA);
 assert.equal(transported.metrics.http_req_duration["p(95)"], 21);
 assert.equal(transported.duration_seconds, 60);
 assert.ok(output.stdout.slice(0, beginIndex).includes("thresholds"), "human text precedes the JSON");
+
+// 7. An arrival-rate run that could not send everything it offered must SAY so: a dropped
+//    iteration is load the server never saw, and without this line the run reads as a target
+//    that coped perfectly.
+const withDrops = buildSummary(
+  sampleData({
+    metrics: {
+      ...sampleData().metrics,
+      dropped_iterations: { type: "counter", contains: "default", values: { count: 412, rate: 6.8 } },
+    },
+  }),
+  meta
+);
+const dropsText = renderText(withDrops);
+assert.ok(dropsText.includes("dropped_iters"), "dropped iterations must be printed when they happen");
+assert.ok(dropsText.includes("412"), "and the count must be the real one");
+assert.ok(dropsText.includes("could NOT send"), "and it must read as a warning, not a statistic");
+
+// ...and NOT printed when there were none, so a healthy run does not carry a scary line.
+assert.ok(!text.includes("dropped_iters"), "a run with no dropped iterations must not print the line");
 
 console.log("summary.test.mjs: all assertions passed");

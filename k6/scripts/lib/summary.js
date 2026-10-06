@@ -36,6 +36,11 @@ const METRIC_ORDER = [
   "http_req_failed",
   "checks",
   "iterations",
+  "iteration_duration",
+  // An arrival-rate scenario drops iterations when it runs out of VUs, and a dropped iteration
+  // was never sent - so the run then looks like a target that coped perfectly. It has to be
+  // visible in the human summary, next to the throughput it quietly reduces.
+  "dropped_iterations",
   "vus_max",
   "data_received",
   "data_sent",
@@ -303,6 +308,7 @@ export function renderText(summary) {
   const metrics = summary.metrics || {};
   const duration = metrics.http_req_duration;
   const waiting = metrics.http_req_waiting;
+  const iterationDuration = metrics.iteration_duration;
   const requests = metrics.http_reqs;
   const failures = metrics.http_req_failed;
   const checks = summary.checks || {};
@@ -362,9 +368,38 @@ export function renderText(summary) {
     lines.push("  vus_max         : " + formatNumber(firstDefined(vusMax.value, vusMax.max), 0));
   }
 
+  /*
+   * A dropped iteration is load the generator did not offer. k6 only reports it for
+   * arrival-rate executors, and it is the difference between "the server coped" and "we never
+   * asked the server" - so it is printed as a warning rather than a statistic, and only when
+   * it happened.
+   */
+  const dropped = metrics.dropped_iterations;
+  if (dropped && typeof dropped.count === "number" && dropped.count > 0) {
+    lines.push(
+      "  dropped_iters   : " +
+        formatNumber(dropped.count, 0) +
+        "  <- iterations the generator could NOT send (raise MAX_VUS, or lower the offered rate)"
+    );
+  }
+
   lines.push("");
   printStats(lines, "http_req_duration", duration, ["avg", "med", "p(90)", "p(95)", "p(99)", "max"]);
   printStats(lines, "http_req_waiting ", waiting, ["avg", "p(95)", "p(99)"]);
+
+  /*
+   * Iteration duration is the end-to-end time for ONE iteration of the scenario, and
+   * for a multi-step journey that is the flow time the user actually experiences.
+   * None of the per-request numbers above can answer it: a journey whose third step
+   * got slower has a flow time that grew while every individual request still looks
+   * acceptable, and a per-request p95 cannot show a step that was ADDED to the flow.
+   *
+   * It includes any think time the scenario sleeps (REQUEST_PAUSE/STEP_PAUSE), which
+   * is deliberate: a closed-model flow is bounded by its own sleeps as much as by the
+   * server, and seeing both numbers is how you tell which one bounds it.
+   */
+  printStats(lines, "iteration_duration", iterationDuration, ["avg", "med", "p(90)", "p(95)", "p(99)", "max"]);
+
   printTaggedSteps(lines, metrics);
 
   const thresholdNames = Object.keys(summary.thresholds || {});

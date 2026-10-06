@@ -1,75 +1,84 @@
 /*
- * JOURNEY TEST - a real multi-step user flow, which is what most load tests
- * actually need to measure.
+ * JOURNEY TEST - a real multi-step user flow.
  *
- * Question it answers : does the flow the user actually performs still meet its
- *                       SLO when many users perform it at once - and which STEP is
- *                       the one that breaks?
- * Profile             : log in once, then each VU repeats the steps.
+ * Question it answers : does the flow the user performs still meet its SLO when many users
+ *                       perform it at once - and which STEP is the one that breaks?
+ * Load shape          : steady (default), load, stress, spike, rate or rate-ramp.
  *
- * WHY THIS FILE EXISTS
- * --------------------
- * Every other scenario in this kit issues a single GET to one URL. That is a
- * perfectly good way to measure an endpoint, and a poor way to measure a product:
- * real traffic is a sequence - authenticate, open the dashboard, load the wallet
- * list, poll the request queue - and the interesting failures are interactions
- * (a token that is reused, a warm cache one step creates for the next) that a
- * single-endpoint test cannot see at all.
+ * ADDING A STEP takes one line. Find STEPS below and add:
  *
- * WHICH STEP IS SLOW?
- * -------------------
- * This is the part that is easy to get wrong. A journey that issues four requests
- * without tagging them produces ONE blended http_req_duration, and "the journey got
- * slower" is then unanswerable. Each request here carries `tags: { name: ... }`, so
- * k6 keeps them as separate sub-metrics and both the console summary and the Grafana
- * dashboards can tell you that /wallets is the slow step and the other three are fine.
- * The thresholds below are per step for the same reason: an SLO belongs to an
- * endpoint, not to a journey.
+ *   { name: "statements", path: envString("STATEMENTS_PATH", "/api/new-core/statements"), p95: 2500 },
  *
+ * The request, its per-step metric, its threshold and its console row are all generated from
+ * that entry - there is nowhere else to edit, and no step can be measured without being named.
+ * (A journey that issues four untagged requests produces ONE blended http_req_duration, and
+ * "the journey got slower" is then unanswerable.)
  *
- * RUN IT AGAINST A HOSTILE-NETWORK TARGET WITH CARE
- * -------------------------------------------------
- * A journey usually points at a shared development environment reached over the public
- * internet, so absolute latency includes WAN round trips and whatever else the team is
- * doing there - and hammering it affects other people. Treat the numbers as "is the
- * flow functional, and roughly how does it scale", then move to a dedicated
- * environment before drawing capacity conclusions.
+ * CONFIGURATION
+ * -------------
+ * There is deliberately no default login URL, no account in this file, and no default API base
+ * beyond TARGET_URL: a built-in login URL lets a run appear to work against an environment
+ * nobody chose, and a password written into a scenario file is a password in git.
  *
- * CONFIGURATION - all required from the environment, with no fallbacks
- * -------------------------------------------------------------------
- * There is deliberately no default login URL, no account anywhere in this file, and no
- * default API base beyond TARGET_URL. A built-in login URL lets a run appear to work
- * against an environment nobody chose; a password written into a scenario file is a
- * password in git. Locally pass these with -EnvVars; in Kubernetes inject them from a
- * Secret.
- *
- *   JOURNEY_USERNAME          required, no default
- *   JOURNEY_PASSWORD          required, no default
  *   LOGIN_URL                 required, no default
- *   API_BASE_URL              optional: falls back to TARGET_URL, which every runner
- *                             already sets, validates and records
- *   KYC_STEP_PATH             default /api/new-core/kyc/step
- *   WALLETS_PATH              default /api/new-core/wallets
- *   REQUESTS_ACTIVE_PATH      default /api/new-core/requests/active
- *   TARGET_VUS                default 5
- *   TEST_DURATION             default 1m
+ *   JOURNEY_USERNAME          required, no default - unless a credential pool is set
+ *   JOURNEY_PASSWORD          required, no default - unless a credential pool is set
+ *   JOURNEY_USERS_JSON        optional: many accounts, one per virtual user (lib/users.js)
+ *   JOURNEY_PROFILE           steady (default) | load | stress | spike | rate | rate-ramp
+ *   API_BASE_URL              optional: falls back to TARGET_URL, which every runner sets
+ *   <STEP>_PATH               each step's path, defaulted in the STEPS table
+ *   REQUEST_HEADERS           optional extra headers, see lib/env.js
  *   STEP_PAUSE                default 0    (think time BETWEEN steps, seconds)
  *   REQUEST_PAUSE             default 0.5  (think time between journeys)
- *   REQUEST_HEADERS           optional extra headers, see lib/env.js
  *
- * HOW THE LOAD IS SHAPED - this is a CLOSED, VU-based model
- * ---------------------------------------------------------
- * One login in setup(), then every VU repeats the three steps for TEST_DURATION at a
- * constant VU count. There is no ramp, no hold and no ramp-down.
+ * LOAD SHAPES - one scenario, six profiles
+ * ----------------------------------------
+ * CLOSED (VU-based): each VU waits for its own response before sending the next request, so
+ * offered load FALLS when the target slows down. Right for "does the flow hold up"; it cannot
+ * answer "what can the server take", because it backs off exactly when the server buckles.
  *
- * Two consequences follow, and both matter when reading the numbers:
- *   * Offered load FALLS when the target slows down, because each VU waits for its own
- *     response before sending the next request. The test backs off exactly when you
- *     want to see the system buckle.
- *   * It cannot answer "does one pod beat three". That comparison needs a FIXED offered
- *     rate, which is what rate-test.js provides.
- * Add `stages` to the options below if you want a ramp; the per-step tags and
- * thresholds keep working unchanged.
+ *   steady      TARGET_VUS for TEST_DURATION                       (the default)
+ *   load        ramp to TARGET_VUS, hold, ramp down                RAMP_DURATION, HOLD_DURATION
+ *   stress      plateaus of STEP_VUS, STRESS_STEPS times, then 0   STEP_DURATION
+ *   spike       baseline, spike, back to baseline                  BASELINE_VUS, SPIKE_VUS, ...
+ *
+ * OPEN (arrival rate): a FIXED number of journey iterations per second is offered whatever the
+ * target does, so a target that cannot keep up queues and its latency rises. This is the shape
+ * to use when the goal is to LOAD A SERVER rather than to characterise a flow:
+ *
+ *   rate        TARGET_RPS iterations/s for TEST_DURATION          TARGET_RPS, PREALLOCATED_VUS, MAX_VUS
+ *   rate-ramp   that rate rising in RATE_STEPS steps, then 0       + RATE_STEPS, STEP_DURATION
+ *
+ * READ dropped_iterations BEFORE TRUSTING A rate RUN. If k6 runs out of VUs it drops
+ * iterations instead of sending them, and the run then looks like a server that coped
+ * perfectly. It is printed in the summary; if it is not zero, raise MAX_VUS or lower
+ * TARGET_RPS - and if raising MAX_VUS fixes it, the generator was the bottleneck, not the API.
+ *
+ * Stress, spike and both rate profiles are SUPPOSED to cross the per-step thresholds; that is
+ * the finding, not a broken build. So the failure gate is loosened for them and does not abort -
+ * aborting would end the run exactly where the interesting part starts. Only a steady run
+ * aborts on the first failed requests, because a broken login should cost seconds, not a whole
+ * profile.
+ *
+ * THE ACCOUNT
+ * -----------
+ * With JOURNEY_USERS_JSON (a credential pool, see lib/users.js) each VU logs in as its OWN
+ * account instead of the whole run sharing one - because thirty VUs on one account serialise on
+ * that account's rows, share its cache and share its quota, so a single-account run can report
+ * a knee that is an artefact of the test. Each request is tagged `account=user-01`, `user-02`,
+ * ... so a slow outlier is visible instead of being averaged away; the account NAME is never a
+ * tag, because tags end up on dashboards.
+ *
+ * A staged or ramped profile starts VUs in waves, so those logins spread across the stages
+ * instead of arriving as one burst - which matters, because a burst of N simultaneous logins is
+ * the first thing an identity provider rate-limits. An arrival-rate profile still needs one
+ * VU per in-flight iteration, so a high TARGET_RPS against a slow target means many VUs, and
+ * therefore many logins.
+ *
+ * A journey usually points at a shared environment reached over the public internet, so
+ * absolute latency includes WAN round trips and whatever else the team is doing there. Treat
+ * the numbers as "is the flow functional, and roughly how does it scale", then move to a
+ * dedicated environment before drawing capacity conclusions.
  */
 
 import http from "k6/http";
@@ -78,6 +87,8 @@ import encoding from "k6/encoding";
 
 import { USER_AGENT, TREND_STATS, buildRequestHeaders, envNumber, envString } from "./lib/env.js";
 import { makeHandleSummary } from "./lib/summary.js";
+import { accountLabel, describeAssignment, loadUsers, userForVu } from "./lib/users.js";
+import { buildProfile } from "./lib/profiles.js";
 
 const testType = "journey";
 
@@ -108,11 +119,44 @@ function assertPresent(names) {
 // No fallback login URL and no account anywhere in this file: a built-in login URL lets
 // a run appear to work against an environment nobody chose, and a password written into
 // a scenario file is a password in git.
-assertPresent(["LOGIN_URL", "JOURNEY_USERNAME", "JOURNEY_PASSWORD"]);
+//
+// The account and password are only required when there is no credential POOL. With a pool
+// (JOURNEY_USERS_JSON) each VU has its own, and demanding one named account as well would
+// be asking for a value the run never uses.
+const pool = loadUsers();
+
+assertPresent(pool ? ["LOGIN_URL"] : ["LOGIN_URL", "JOURNEY_USERNAME", "JOURNEY_PASSWORD"]);
 
 const loginUrl = envString("LOGIN_URL", "");
 const username = envString("JOURNEY_USERNAME", "");
 const password = envString("JOURNEY_PASSWORD", "");
+
+if (pool && envString("JOURNEY_USERNAME", "") !== "") {
+  console.log(
+    "[journey] JOURNEY_USERNAME is set but a pool of " + pool.users.length + " account(s) came from " +
+      pool.source + "; the pool wins and the single account is unused."
+  );
+}
+
+/*
+ * The journey authenticates itself, so the generic mechanism in lib/auth.js is redundant
+ * here - and it is not merely redundant, it is expensive. With AUTH_MODE left on, every VU
+ * logs in TWICE on its first iteration: once for the journey, once for lib/auth.js. That
+ * doubles the login burst at exactly the moment the identity provider is at its busiest,
+ * and on an IdP that rate-limits it turns into a wall of "login response has no token"
+ * errors that look like the API failing.
+ *
+ * The runners pass AUTH_MODE=off. This warns when something else did not, because the
+ * symptom is otherwise invisible: the run works, it is just measuring more logins than it
+ * claims to.
+ */
+const configuredAuthMode = envString("AUTH_MODE", "");
+if (configuredAuthMode !== "" && configuredAuthMode.toLowerCase() !== "off") {
+  console.warn(
+    "[journey] AUTH_MODE=" + configuredAuthMode + " is set, but this scenario authenticates itself. lib/auth.js " +
+      "will therefore log in once MORE per VU on top of each VU's own login. Set AUTH_MODE=off to stop that."
+  );
+}
 
 // The API base is API_BASE_URL, or TARGET_URL - which both runners already set, validate
 // and record, so `-TargetUrl <api base>` is enough to run a journey. At least one must be
@@ -126,57 +170,113 @@ if (envString("API_BASE_URL", "") === "" && envString("TARGET_URL", "") === "") 
 
 const apiBaseUrl = (envString("API_BASE_URL", "") || envString("TARGET_URL", "")).replace(/\/+$/, "");
 
-const kycStepPath = envString("KYC_STEP_PATH", "/api/new-core/kyc/step");
-const walletsPath = envString("WALLETS_PATH", "/api/new-core/wallets");
-const requestsActivePath = envString("REQUESTS_ACTIVE_PATH", "/api/new-core/requests/active");
+/*
+ * ============================ THE STEPS ============================
+ * One line per step. Everything else is generated from this table:
+ *
+ *   name   what the step is called in metrics, thresholds and the console summary.
+ *          Keep it free of "/" so it is safe as a Prometheus label value and as a k6
+ *          threshold selector.
+ *   path   appended to the API base. Defaulted here, overridable per environment.
+ *   p95    the SLO for THIS step, in milliseconds - because an SLO belongs to an endpoint,
+ *          not to a journey.
+ *
+ * Add one, remove one, reorder them: the iteration runs them in order and each keeps its
+ * own metrics.
+ * ===================================================================
+ */
+const STEPS = [
+  { name: "kyc-step", path: envString("KYC_STEP_PATH", "/kyc/step"), p95: 2000 },
+  { name: "wallets", path: envString("WALLETS_PATH", "/wallets"), p95: 2000 },
+  { name: "requests-active", path: envString("REQUESTS_ACTIVE_PATH", "/requests/active"), p95: 2000 },
+];
 
-const targetVus = envNumber("TARGET_VUS", 5);
-const testDuration = envString("TEST_DURATION", "1m");
+// Exported so the harness in k6/tests can assert against the table itself rather than against
+// a second copy of the paths - a copy that would go stale the first time somebody edits a step.
+export { STEPS };
+
+const STEP_LOGIN = "login";
+
 const stepPause = envNumber("STEP_PAUSE", 0);
 const requestPause = envNumber("REQUEST_PAUSE", 0.5);
 
-// Tag names are deliberately free of "/" so they are safe as Prometheus label values
-// and as k6 threshold selectors.
-const STEP_LOGIN = "login";
-const STEP_KYC = "kyc-step";
-const STEP_WALLETS = "wallets";
-const STEP_REQUESTS = "requests-active";
+/*
+ * The load shape: steady by default, or load/stress/spike. Same knob names as the
+ * single-endpoint scenarios, so STEP_VUS here means what it means in stress-test.js.
+ */
+const journeyProfile = envString("JOURNEY_PROFILE", "steady");
+const profile = buildProfile(journeyProfile, {
+  vus: envNumber("TARGET_VUS", 5),
+  duration: envString("TEST_DURATION", "1m"),
+  stepVus: envNumber("STEP_VUS", 10),
+  stepCount: envNumber("STRESS_STEPS", 4),
+  stepDuration: envString("STEP_DURATION", "1m"),
+  rampDuration: envString("RAMP_DURATION", "1m"),
+  holdDuration: envString("HOLD_DURATION", "5m"),
+  baselineVus: envNumber("BASELINE_VUS", 5),
+  spikeVus: envNumber("SPIKE_VUS", 50),
+  baselineDuration: envString("BASELINE_DURATION", "30s"),
+  spikeDuration: envString("SPIKE_DURATION", "1m"),
+  // The open-model profiles: a FIXED offered rate, which is the only way to keep pushing a
+  // server that is already slowing down.
+  targetRps: envNumber("TARGET_RPS", 100),
+  preAllocatedVus: envNumber("PREALLOCATED_VUS", 50),
+  maxVus: envNumber("MAX_VUS", 400),
+  rateSteps: envNumber("RATE_STEPS", 4),
+  scenarioName: "journey",
+});
 
-export const options = {
-  discardResponseBodies: true,
-  summaryTrendStats: TREND_STATS,
-  userAgent: USER_AGENT,
-  tags: { test_type: testType },
+console.log("[journey] load profile: " + journeyProfile + " - " + profile.summary);
 
-  vus: targetVus,
-  duration: testDuration,
+/*
+ * Per-step SLOs, generated from the table above.
+ *
+ * This is the payoff of naming every request: a single slow step fails its own threshold
+ * instead of averaging away inside one journey-wide number.
+ */
+const thresholds = { checks: ["rate>0.99"] };
+thresholds["http_req_duration{name:" + STEP_LOGIN + "}"] = ["p(95)<3000"];
+STEPS.forEach(function (step) {
+  thresholds["http_req_duration{name:" + step.name + "}"] = ["p(95)<" + step.p95];
+});
 
-  thresholds: {
-    // abortOnFail: a journey where authentication or the first step is broken should
-    // stop in seconds, not spend the whole duration generating 401s. A whole run of
-    // failures is the most expensive possible way to learn that a password changed.
-    http_req_failed: [{ threshold: "rate<0.01", abortOnFail: true, delayAbortEval: "20s" }],
-    checks: ["rate>0.99"],
+if (profile.steady) {
+  // abortOnFail: a journey where authentication or the first step is broken should stop in
+  // seconds, not spend the whole duration generating 401s. A whole run of failures is the
+  // most expensive possible way to learn that a password changed.
+  thresholds.http_req_failed = [{ threshold: "rate<0.01", abortOnFail: true, delayAbortEval: "20s" }];
+}
+else {
+  // A stress or spike run is SUPPOSED to make the target fail; aborting at the first sign of
+  // it would stop the run exactly where the interesting part begins. Loosened, and no abort.
+  thresholds.http_req_failed = ["rate<0.05"];
+}
 
-    // Per-step SLOs. This is the payoff of tagging each request: a single slow step
-    // fails its own threshold instead of averaging away inside a journey-wide number.
-    "http_req_duration{name:login}": ["p(95)<3000"],
-    "http_req_duration{name:kyc-step}": ["p(95)<2000"],
-    "http_req_duration{name:wallets}": ["p(95)<2000"],
-    "http_req_duration{name:requests-active}": ["p(95)<2000"],
+export const options = Object.assign(
+  {
+    discardResponseBodies: true,
+    summaryTrendStats: TREND_STATS,
+    userAgent: USER_AGENT,
+    tags: { test_type: testType },
   },
-};
+  profile.options,
+  { thresholds: thresholds }
+);
 
 /*
  * Log in and return the access token.
  *
- * Exported so a scenario that wants to authenticate per iteration (or to measure the
- * identity provider) can reuse it rather than duplicating the request shape.
+ * `account` is { username, password } when this VU has its own from a pool, and null for a
+ * single-account run. Exported so a scenario that wants to authenticate per iteration (or to
+ * measure the identity provider) can reuse it rather than duplicating the request shape.
  */
-export function login() {
+export function login(account, tag) {
+  const accountName = account ? account.username : username;
+  const accountPassword = account ? account.password : password;
+
   const response = http.post(
     loginUrl,
-    JSON.stringify({ Email: username, Password: password, RememberMe: true }),
+    JSON.stringify({ Email: accountName, Password: accountPassword, RememberMe: true }),
     {
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       // Load-bearing. Options.discardResponseBodies is true for this test - the
@@ -185,7 +285,7 @@ export function login() {
       // is a run where the login POST returns 200 and looks healthy in the metrics
       // while every iteration fails with a confusing parse error.
       responseType: "text",
-      tags: { name: STEP_LOGIN },
+      tags: tag ? { name: STEP_LOGIN, account: tag } : { name: STEP_LOGIN },
     }
   );
 
@@ -195,8 +295,10 @@ export function login() {
         response.status +
         " from " +
         loginUrl +
+        (account ? " as " + accountName : "") +
         ".\n" +
-        "Check JOURNEY_USERNAME/JOURNEY_PASSWORD. Response: " +
+        "Check JOURNEY_USERNAME/JOURNEY_PASSWORD, or the entry for this account in the credential pool." +
+        " Response: " +
         String(response.body).slice(0, 300)
     );
   }
@@ -274,14 +376,58 @@ function logTokenLifetime(token) {
   }
 }
 
+/*
+ * This VU's account and token, when the run has a pool.
+ *
+ * Module state is per VU - k6 gives every VU its own JavaScript runtime - so `cachedToken`
+ * below is this VU's token and nobody else's, which is exactly what a per-account run needs.
+ *
+ * The lookup is deliberately NOT done at module scope: it needs __VU, and module scope is
+ * the init context, where __VU is 0. Resolving there would hand every VU the first account
+ * in the pool - one account, many sessions, which is the thing this feature exists to avoid.
+ */
+let cachedToken = null;
+let cachedAccount = null;
+
+function tokenForThisVu() {
+  if (cachedToken !== null) {
+    return cachedToken;
+  }
+
+  const assignment = userForVu(pool.users, __VU);
+  cachedAccount = accountLabel(assignment.index);
+
+  // One line per VU, which is the same volume as the token line below and is the only way
+  // to tell from a finished run which account owned which VU.
+  console.log(describeAssignment(pool.users, __VU, assignment.index));
+
+  cachedToken = login(assignment.user, cachedAccount);
+  return cachedToken;
+}
+
+/*
+ * Single-account runs log in once here, before any VU starts, so the whole run shares one
+ * token and the login is measured once rather than once per VU.
+ *
+ * A pooled run cannot do that: setup() runs in its own context where there is no VU to
+ * attribute an account to, so each VU authenticates as itself on first use instead.
+ */
 export function setup() {
+  if (pool) {
+    return { pooled: pool.users.length };
+  }
   return { token: login() };
 }
 
-function requestStep(name, url, headers) {
+function requestStep(name, url, headers, account) {
+  const tags = { name: name };
+  if (account) {
+    tags.account = account;
+  }
+
   const response = http.get(url, {
     headers: headers,
-    tags: { name: name },
+    tags: tags,
   });
 
   // A check per step, so summary.json names the step that returned a bad status
@@ -294,24 +440,28 @@ function requestStep(name, url, headers) {
 }
 
 export default function (data) {
+  // A pooled run resolves its token (and its account) on first use, per VU.
+  const token = data.token ? data.token : tokenForThisVu();
+  const account = data.token ? null : cachedAccount;
+
   // buildRequestHeaders() keeps REQUEST_HEADERS working as an escape hatch for extra
   // headers (a tenant id, a gateway token). The Authorization header set here wins,
   // because the token in `data` is the logged-in one for this run.
   const headers = Object.assign({}, buildRequestHeaders(), {
-    Authorization: "Bearer " + data.token,
+    Authorization: "Bearer " + token,
   });
 
-  requestStep(STEP_KYC, apiBaseUrl + kycStepPath, headers);
-  if (stepPause > 0) {
-    sleep(stepPause);
-  }
+  // One pass through the table. Adding a step to STEPS adds it here, with its own metric,
+  // its own threshold and its own console row.
+  STEPS.forEach(function (step, index) {
+    requestStep(step.name, apiBaseUrl + step.path, headers, account);
 
-  requestStep(STEP_WALLETS, apiBaseUrl + walletsPath, headers);
-  if (stepPause > 0) {
-    sleep(stepPause);
-  }
-
-  requestStep(STEP_REQUESTS, apiBaseUrl + requestsActivePath, headers);
+    // Think time BETWEEN steps - not after the last one, which would be dead time before the
+    // journey's own pause.
+    if (stepPause > 0 && index < STEPS.length - 1) {
+      sleep(stepPause);
+    }
+  });
 
   sleep(requestPause);
 }

@@ -16,7 +16,7 @@
 
     Everything else - the run directory, summary.json, meta.json, the testid, the
     Grafana link - belongs to run-test.ps1 and is reused unchanged, so a journey run and
-    a smoke run produce comparable artefacts in the same place.
+    a smoke run produce comparable artifacts in the same place.
 
 CONFIGURATION, AND WHERE IT COMES FROM
     Values are resolved in this order, first hit winning:
@@ -51,8 +51,37 @@ CONFIGURATION, AND WHERE IT COMES FROM
 .PARAMETER EnvFile
     Path to the .env file. Omit to use the default search.
 
+.PARAMETER UsersFile
+    Path to a JSON file of test accounts, one per virtual user:
+
+      [{ "username": "a@example.com", "password": "..." }, ...]
+
+    Omit it and k6\users.json is used when it exists, so the usual setup is one file and one
+    command. With a pool, each VU runs the journey as its OWN account and each request is
+    tagged with user-01, user-02, ... - see the note in journey-test.js about why thirty VUs
+    sharing one account is a different (and misleading) test.
+
+    Pass -Vus equal to the number of accounts to give every VU a distinct one.
+
 .PARAMETER Vus
-    Concurrent virtual users. Default 5, or TARGET_VUS from the file.
+    Concurrent virtual users for the default steady profile. Default 5, or TARGET_VUS from
+    the file. Ignored by -Profile stress and -Profile spike, which compute their own VU
+    counts from STEP_VUS/STRESS_STEPS and BASELINE_VUS/SPIKE_VUS.
+
+.PARAMETER Profile
+    steady (default) | load | stress | spike - the load SHAPE, not the test type.
+
+      steady   Vus for Duration, constant (what the journey has always done)
+      load     ramp to Vus, hold, ramp down        RAMP_DURATION, HOLD_DURATION
+      stress   plateaus, each STEP_VUS larger      STEP_VUS, STRESS_STEPS, STEP_DURATION
+      spike    baseline, spike, back to baseline   BASELINE_VUS, SPIKE_VUS, ...
+
+    For a stress run the per-step thresholds are EXPECTED to fail: that is the finding, not a
+    broken build. The failure gate is loosened for those profiles and will not abort the run.
+
+.PARAMETER EnvVars
+    Extra scenario knobs, NAME=value, comma separated - e.g
+    -EnvVars STEP_VUS=10,STRESS_STEPS=4,STEP_DURATION=2m. These win over the environment file.
 
 .PARAMETER Duration
     How long the VUs keep repeating the journey. Default 1m, or TEST_DURATION.
@@ -96,11 +125,14 @@ param(
 
     [ValidateRange(1, 2000)][int] $Vus = 5,
     [string] $Duration = '1m',
+    [ValidateSet('steady', 'load', 'stress', 'spike', 'rate', 'rate-ramp')][string] $Profile = 'steady',
+    [string[]] $EnvVars = @(),
     [ValidateRange(0, 600)][double] $StepPause = 0,
     [ValidateRange(0, 600)][double] $RequestPause = 0.5,
 
     [string] $ApiBaseUrl,
     [string] $EnvFile,
+    [string] $UsersFile,
     [string] $ResultsRoot,
 
     [switch] $NoStack,
@@ -125,6 +157,14 @@ $envFileResult = Import-PerfTestEnvFile -ExplicitPath $EnvFile -SearchPaths @(
     (Join-Path $repoRoot '.env')
 )
 $fileEnv = $envFileResult.Values
+
+# A pool of accounts, one per VU, replaces the single account entirely: no username to
+# resolve, no password to prompt for, nothing to redact. Resolved before the account
+# handling below so that "is an account needed at all?" is answered once.
+$usersFilePath = Resolve-PerfTestUsersFile -ExplicitPath $UsersFile -Environment $fileEnv -SearchPaths @(
+    (Join-Path $PSScriptRoot 'users.json')
+)
+$pooled = -not [string]::IsNullOrEmpty($usersFilePath)
 
 if ($envFileResult.Path) {
     Write-Host "Environment file : $($envFileResult.Path)" -ForegroundColor Cyan
@@ -172,14 +212,31 @@ $resolvedUsername = Get-Setting $Username 'JOURNEY_USERNAME'
 $resolvedApiBase = Get-Setting $ApiBaseUrl 'API_BASE_URL'
 
 try {
-    $resolvedVus = [int](Get-TypedSetting $cliBound.ContainsKey('Vus') $Vus 'TARGET_VUS' 5)
+    $resolvedVus = [int](Get-TypedSetting $cliBound.ContainsKey('Vus') $Vus 'TARGET_VUS' 7)
     $resolvedDuration = [string](Get-TypedSetting $cliBound.ContainsKey('Duration') $Duration 'TEST_DURATION' '1m')
+    $resolvedProfile = [string](Get-TypedSetting $cliBound.ContainsKey('Profile') $Profile 'JOURNEY_PROFILE' 'steady')
     $resolvedStepPause = [double](Get-TypedSetting $cliBound.ContainsKey('StepPause') $StepPause 'STEP_PAUSE' 0)
     $resolvedRequestPause = [double](Get-TypedSetting $cliBound.ContainsKey('RequestPause') $RequestPause 'REQUEST_PAUSE' 0.5)
 }
 catch {
     throw ("A load-profile value in the environment file is not usable: $($_.Exception.Message)`n" +
         'TARGET_VUS, STEP_PAUSE and REQUEST_PAUSE must be numbers; TEST_DURATION is a duration such as 30s or 1m.')
+}
+
+if (@('steady', 'load', 'stress', 'spike', 'rate', 'rate-ramp') -notcontains $resolvedProfile) {
+    throw ("JOURNEY_PROFILE is '$resolvedProfile', which is not one of: steady, load, stress, spike.`n" +
+        'Fix it in the environment file, or pass -Profile on the command line.')
+}
+
+# What each shape means, said in the run's own output rather than only in a doc: a stress run
+# whose thresholds fail is the expected outcome, and that is worth stating before it happens.
+$profileDescription = @{
+    steady    = "$resolvedVus VU(s) for $resolvedDuration, constant (closed model - offered load falls when the target slows)"
+    load      = "ramp to $resolvedVus VU(s), hold, ramp down (RAMP_DURATION / HOLD_DURATION)"
+    stress    = "stepped plateaus of STEP_VUS, STRESS_STEPS times, then a plateau at 0 (STEP_DURATION)"
+    spike     = "baseline, spike to SPIKE_VUS, back to baseline (recovery window)"
+    rate      = "a FIXED TARGET_RPS for TEST_DURATION (open model - the offered load does not fall when the target slows)"
+    'rate-ramp' = "a FIXED offered rate rising in RATE_STEPS steps, then back to 0 (open model)"
 }
 
 # ---------------------------------------------------------------------------
@@ -208,7 +265,7 @@ foreach ($url in @($resolvedTarget, $resolvedLogin)) {
     }
 }
 
-if (-not $resolvedUsername) {
+if (-not $resolvedUsername -and -not $pooled) {
     Write-Host 'Username was not supplied and is not in the environment file.' -ForegroundColor Cyan
     $resolvedUsername = (Read-Host 'Account username').Trim()
     if (-not $resolvedUsername) { throw 'No username was supplied.' }
@@ -231,7 +288,14 @@ if (-not $AllowProduction -and $targetHost -match '(?i)(^|[.\-])prod(uction)?([.
 # ---------------------------------------------------------------------------
 # 4. The password. Never printed, whatever its source.
 # ---------------------------------------------------------------------------
-if ($null -ne $Password) {
+if ($pooled) {
+    # The pool carries the credentials, so there is nothing to prompt for and nothing that
+    # could end up in an artefact: the file is handed to k6 as a variable, and the runners
+    # on the cluster side put it in a Secret.
+    $plainPassword = ''
+    $passwordSource = "the credential pool ($usersFilePath)"
+}
+elseif ($null -ne $Password) {
     if ($Password.Length -eq 0) { throw 'The password is empty.' }
     $plainPassword = [System.Net.NetworkCredential]::new('', $Password).Password
     $passwordSource = 'command line'
@@ -267,19 +331,36 @@ foreach ($pair in @(
 }
 
 $envEntries = @(
-    # The journey authenticates itself: one login in setup(), reused by every VU. The
-    # generic mechanism in lib/auth.js would log in once per VU on top of that, so it is
-    # switched off for this run. Without this, a .env file that enables json-login for
-    # the other test types would also apply here and cost a redundant login per VU.
+    # The journey authenticates itself: one login in setup(), reused by every VU - or one per
+    # VU when a credential pool is in use. The generic mechanism in lib/auth.js would log in
+    # again on top of that, so it is switched off for this run. Without this, a .env file
+    # that enables json-login for the other test types would also apply here and cost a
+    # redundant login for every VU.
     'AUTH_MODE=off'
     "LOGIN_URL=$resolvedLogin"
-    "JOURNEY_USERNAME=$resolvedUsername"
-    "JOURNEY_PASSWORD=$plainPassword"
     "TARGET_VUS=$resolvedVus"
     "TEST_DURATION=$resolvedDuration"
+    "JOURNEY_PROFILE=$resolvedProfile"
     "STEP_PAUSE=$resolvedStepPause"
     "REQUEST_PAUSE=$resolvedRequestPause"
 )
+
+# Knobs the profile needs (STEP_VUS, STRESS_STEPS, STEP_DURATION, HOLD_DURATION, ...) reach
+# k6 the same way - from the environment file, or from here. They are not enumerated: the
+# scenario owns their names and defaults, and a second list here would drift from it.
+foreach ($entry in $EnvVars) {
+    foreach ($part in ("$entry" -split ',')) {
+        if ($part.Trim()) { $envEntries += $part.Trim() }
+    }
+}
+
+# The single account is passed only when there IS one: with a pool, setting
+# JOURNEY_USERNAME as well would be two sources of truth for the same thing, and the
+# scenario would have to tell you which won.
+if (-not $pooled) {
+    $envEntries += "JOURNEY_USERNAME=$resolvedUsername"
+    $envEntries += "JOURNEY_PASSWORD=$plainPassword"
+}
 
 if ($resolvedApiBase) { $envEntries += "API_BASE_URL=$resolvedApiBase" }
 
@@ -287,8 +368,24 @@ Write-Host ''
 Write-Host 'Journey load test' -ForegroundColor Cyan
 Write-Host "  API base   : $resolvedTarget"
 Write-Host "  login      : $resolvedLogin"
-Write-Host "  account    : $resolvedUsername  (password from $passwordSource, not echoed)"
-Write-Host "  load       : $resolvedVus VU(s) for $resolvedDuration  (closed model - no ramp)"
+if ($pooled) {
+    $poolJson = Read-PerfTestUsersFile -Path $usersFilePath
+    $poolParsed = $poolJson | ConvertFrom-Json
+    $poolAccounts = if ($poolParsed -is [array]) { @($poolParsed) } elseif ($poolParsed.users) { @($poolParsed.users) } else { @() }
+
+    Write-Host "  accounts   : $($poolAccounts.Count) from $usersFilePath  (one per VU, round robin)"
+    if ($poolAccounts.Count -lt $resolvedVus) {
+        Write-Host ("               fewer accounts than VUs, so $($poolAccounts.Count) account(s) will be shared -" ) -ForegroundColor DarkYellow
+        Write-Host '               raise the pool size or lower -Vus for one account per VU.' -ForegroundColor DarkYellow
+    }
+    elseif ($poolAccounts.Count -gt $resolvedVus) {
+        Write-Host "               $($poolAccounts.Count - $resolvedVus) account(s) will go unused at -Vus $resolvedVus." -ForegroundColor DarkYellow
+    }
+}
+else {
+    Write-Host "  account    : $resolvedUsername  (password from $passwordSource, not echoed)"
+}
+Write-Host "  load       : $($profileDescription[$resolvedProfile])"
 Write-Host "  think time : $resolvedStepPause s between steps, $resolvedRequestPause s between journeys"
 Write-Host '  steps      : kyc-step -> wallets -> requests-active, each measured separately'
 Write-Host ''
@@ -302,6 +399,9 @@ Write-Host ''
 # -SkipPreflight is not negotiable here (see above). -EnvFile is passed through as well,
 # so any other key in the file (REQUEST_HEADERS, AUTH_*) reaches k6 too; the explicit
 # -EnvVars above win over it for the keys this script resolved.
+#
+# -UsersFile is passed as its own parameter, not as an env entry: a JSON array contains
+# commas, and the -EnvVars parser splits on commas.
 # ---------------------------------------------------------------------------
 $runnerArguments = @{
     TargetUrl     = $resolvedTarget
@@ -310,6 +410,7 @@ $runnerArguments = @{
     SkipPreflight = $true
 }
 
+if ($pooled) { $runnerArguments.UsersFile = $usersFilePath }
 if ($envFileResult.Path) { $runnerArguments.EnvFile = $envFileResult.Path }
 if ($ResultsRoot) { $runnerArguments.ResultsRoot = $ResultsRoot }
 if ($NoStack) { $runnerArguments.NoStack = $true }

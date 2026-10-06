@@ -109,6 +109,24 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Could not create the observability namespace. Is kubectl pointed at a cluster?'
 }
 
+function Get-ConfigMapVersion {
+    <# The ConfigMap's resourceVersion, or '' when it does not exist yet. #>
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][string] $NamespaceName
+    )
+
+    $text = (& kubectl get configmap $Name -n $NamespaceName -o jsonpath='{.metadata.resourceVersion}' 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return $text
+}
+
+# Read the versions BEFORE the apply, so the restart below can be skipped when nothing
+# actually changed. `kubectl apply` of identical content is a no-op that leaves the
+# resourceVersion alone, which makes it an exact signal for "the dashboards are the same".
+$dashboardsBefore = Get-ConfigMapVersion -Name 'grafana-dashboards' -NamespaceName $Namespace
+$provisioningBefore = Get-ConfigMapVersion -Name 'grafana-provisioning' -NamespaceName $Namespace
+
 New-ConfigMapFromFiles -Name 'grafana-provisioning' -FromFileArguments $provisioningArguments
 
 $dashboardArguments = @()
@@ -125,7 +143,25 @@ if ($LASTEXITCODE -ne 0) {
 
 # A ConfigMap is mounted as a volume, so Grafana only sees a changed dashboard
 # after it restarts - and it caches the provisioning files read at start-up.
-& kubectl rollout restart deployment/grafana -n $Namespace 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+#
+# That restart is expensive in a way the line above does not suggest: it replaces the pod,
+# and everything attached to that pod dies with it - an open dashboard in a browser, and
+# any `kubectl port-forward` pointing at the Service, whose next connection fails with
+# `container not running` / `error: lost connection to pod`. This script used to restart
+# unconditionally on every invocation, which on a real cluster meant a new Grafana pod on
+# every single test run (nine ReplicaSets in one day, all but one scaled to zero). So:
+# restart only when the dashboards or the provisioning actually changed.
+$dashboardsAfter = Get-ConfigMapVersion -Name 'grafana-dashboards' -NamespaceName $Namespace
+$provisioningAfter = Get-ConfigMapVersion -Name 'grafana-provisioning' -NamespaceName $Namespace
+
+if ($dashboardsBefore -ne '' -and $provisioningBefore -ne '' -and
+    $dashboardsBefore -eq $dashboardsAfter -and $provisioningBefore -eq $provisioningAfter) {
+    Write-Host 'Dashboards and provisioning are unchanged, so Grafana was left running.' -ForegroundColor DarkGray
+    Write-Host '  (Restarting it would replace the pod and drop anyone watching a dashboard, or any port-forward to it.)' -ForegroundColor DarkGray
+}
+else {
+    & kubectl rollout restart deployment/grafana -n $Namespace 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+}
 
 if (-not $SkipWait) {
     Write-Host 'Waiting for Prometheus and Grafana...' -ForegroundColor Cyan
@@ -140,8 +176,50 @@ if (-not $SkipWait) {
 
 Write-Host ''
 Write-Host 'Observability stack is up:' -ForegroundColor Green
-Write-Host '  Grafana    : http://127.0.0.1:30030/d/k6-load-test'
-Write-Host '  Prometheus : http://127.0.0.1:30090/graph'
+
+# A NodePort is opened on the NODE's network, not on the host's loopback.
+#
+# Docker Desktop's built-in Kubernetes does forward NodePorts to 127.0.0.1, which is why
+# this script used to print that address unconditionally - but minikube's nodes live on
+# 192.168.49.0/24 inside a VM, and kind's on a docker network, and neither is routable
+# from the host. The URL was then a dead link, and a working Grafana looked broken. So ask
+# whether the port actually answers, and when it does not, give a route that always works:
+# the API server carries the TCP for a port-forward, and `minikube service` opens a tunnel.
+$grafanaNodePort = 30030
+$prometheusNodePort = 30090
+
+$grafanaOnLoopback = Test-PerfTestTcpEndpoint -Port $grafanaNodePort
+$prometheusOnLoopback = Test-PerfTestTcpEndpoint -Port $prometheusNodePort
+
+# The local port for a port-forward must be free, and "free" includes "not already your
+# compose Grafana": forwarding in-cluster Grafana onto a port the compose stack publishes
+# shows the wrong dashboard against the wrong Prometheus.
+$grafanaLocalPort = Get-PerfTestFreeLocalPort -Candidate @(3000, 3001, 3002, 3003)
+$prometheusLocalPort = Get-PerfTestFreeLocalPort -Candidate @(9090, 9091, 9092, 9093)
+
+if ($grafanaOnLoopback) {
+    Write-Host "  Grafana    : http://127.0.0.1:$grafanaNodePort/d/k6-load-test"
+}
+else {
+    Write-Host "  Grafana    : http://127.0.0.1:$grafanaLocalPort/d/k6-load-test   (after the port-forward below)"
+}
+
+if ($prometheusOnLoopback) {
+    Write-Host "  Prometheus : http://127.0.0.1:$prometheusNodePort/graph"
+}
+else {
+    Write-Host "  Prometheus : http://127.0.0.1:$prometheusLocalPort/graph   (after the port-forward below)"
+}
+
+if (-not $grafanaOnLoopback -or -not $prometheusOnLoopback) {
+    Write-Host ''
+    Write-Host "Neither $grafanaNodePort nor $prometheusNodePort answers on 127.0.0.1, which is expected on minikube and" -ForegroundColor DarkGray
+    Write-Host 'kind: a NodePort is opened on the node network, not on your machine. Reach it with:' -ForegroundColor DarkGray
+    Write-Host "  kubectl port-forward -n $Namespace svc/grafana ${grafanaLocalPort}:3000         # then http://127.0.0.1:$grafanaLocalPort" -ForegroundColor DarkGray
+    Write-Host "  kubectl port-forward -n $Namespace svc/prometheus ${prometheusLocalPort}:9090  # then http://127.0.0.1:$prometheusLocalPort" -ForegroundColor DarkGray
+    Write-Host "  minikube service -n $Namespace grafana                          # opens it for you, via a tunnel" -ForegroundColor DarkGray
+}
+
 Write-Host ('  Remote write endpoint for -PrometheusWriteUrl: http://prometheus.{0}.svc.cluster.local:9090/api/v1/write' -f $Namespace)
 Write-Host ''
 Write-Host 'Use 127.0.0.1, not localhost: Docker Desktop publishes on IPv6 as well and its IPv6 proxy hangs here.' -ForegroundColor DarkGray

@@ -1,0 +1,14 @@
+[
+  {
+    "_comment": "Copy this file to k6/users.json and replace the entries. k6/users.json is gitignored - it holds passwords.",
+
+    "username": "loadtest01@example.com",
+    "password": "change-me",
+    "note": "extra keys are ignored"
+  },
+  {
+    "username": "loadtest02@example.com",
+    "password": "change-me"
+  },
+  "loadtest03@example.com:change-me"
+]
